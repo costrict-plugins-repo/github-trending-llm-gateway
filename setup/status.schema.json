@@ -1,0 +1,874 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://verivus.ai/schemas/llm-cli-gateway/status.schema.json",
+  "title": "llm-cli-gateway doctor status",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "ok",
+    "storage",
+    "generated_at",
+    "system",
+    "gateway",
+    "transport",
+    "auth",
+    "workspaces",
+    "providers",
+    "endpoint_exposure",
+    "remote_http_oauth",
+    "client_config",
+    "cache_awareness",
+    "provider_capabilities",
+    "least_cost",
+    "personal_config",
+    "upstream",
+    "next_actions"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.2" },
+    "ok": { "type": "boolean" },
+    "storage": {
+      "description": "Storage health for the flight recorder and the job store. Added at schema_version 1.1: 1.0 reported none, so a corrupt or unreadable transcript database produced a report byte-identical to a quiet one. `scanned` is false for a caller that ran no asynchronous scan, and every measurement is null in that case rather than zero.",
+      "type": "object",
+      "required": [
+        "scanned",
+        "flight_recorder",
+        "job_store",
+        "retention",
+        "co_resident",
+        "warnings"
+      ],
+      "properties": {
+        "scanned": { "type": "boolean" },
+        "flight_recorder": {
+          "type": "object",
+          "required": [
+            "state",
+            "path",
+            "reads_are_authoritative",
+            "error",
+            "file_bytes",
+            "wal_bytes",
+            "schema_version",
+            "request_rows",
+            "oldest_request",
+            "newest_request"
+          ],
+          "properties": {
+            "state": {
+              "type": ["string", "null"],
+              "enum": ["disabled", "unavailable", "initialising", "degraded", "active", null],
+              "description": "disabled = the operator turned recording off. unavailable = it failed to open. degraded = open, but the schema bootstrap or the last operation failed. initialising = open, bootstrap not settled. active = open and working. null = not scanned."
+            },
+            "path": { "type": ["string", "null"] },
+            "reads_are_authoritative": { "type": "boolean" },
+            "error": { "type": ["string", "null"] },
+            "file_bytes": { "type": ["integer", "null"] },
+            "wal_bytes": { "type": ["integer", "null"] },
+            "schema_version": { "type": ["integer", "null"] },
+            "request_rows": { "type": ["integer", "null"] },
+            "oldest_request": { "type": ["string", "null"] },
+            "newest_request": { "type": ["string", "null"] }
+          },
+          "additionalProperties": false
+        },
+        "job_store": {
+          "type": "object",
+          "required": ["backend", "path", "shares_flight_recorder_file"],
+          "properties": {
+            "backend": { "type": "string" },
+            "path": { "type": ["string", "null"] },
+            "shares_flight_recorder_file": { "type": "boolean" }
+          },
+          "additionalProperties": false
+        },
+        "retention": {
+          "description": "The resolved retention policy and what it would delete. Extended at schema_version 1.2: 1.1 reported the job store's `days` and a hard-coded `unbounded` list, so an operator could see that transcripts were unbounded but not how much that cost or what a bound would remove.",
+          "type": "object",
+          "required": [
+            "days",
+            "unbounded",
+            "policy",
+            "requests_beyond_retention",
+            "reclaimable_bytes"
+          ],
+          "properties": {
+            "days": {
+              "type": ["integer", "null"],
+              "description": "The job store's bound, in days. Unchanged in meaning."
+            },
+            "unbounded": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Subsystems the policy does not bound, derived from it. All three destructive bounds default to OFF, so an unchanged installation lists `jobs`, `requests`, and `wedgedValidationRuns` here."
+            },
+            "policy": {
+              "type": ["object", "null"],
+              "additionalProperties": { "type": ["integer", "null"] },
+              "description": "Days per subsystem; null per key means nothing deletes it. null for the whole object means the persistence config could not be read."
+            },
+            "requests_beyond_retention": {
+              "type": ["integer", "null"],
+              "description": "Rows a `requests` sweep would delete right now. A dry run: counted, never deleted. Falls back to the job window when no transcript bound is set."
+            },
+            "reclaimable_bytes": {
+              "type": ["integer", "null"],
+              "description": "Bytes a compaction would return to the filesystem. SQLite only; null on PostgreSQL, where autovacuum reuses the space and there is no operator step. A DELETE frees pages, never bytes."
+            }
+          },
+          "additionalProperties": false
+        },
+        "co_resident": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["table", "rows", "unfinished", "live"],
+            "properties": {
+              "table": { "type": "string" },
+              "rows": { "type": "integer" },
+              "unfinished": { "type": "integer" },
+              "live": {
+                "type": "boolean",
+                "description": "False means this table belongs to a subsystem that no longer uses this file. Its rows are frozen at the switchover and still answer queries."
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "warnings": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "system": {
+      "type": "object",
+      "required": ["os", "arch", "release", "node_version"],
+      "properties": {
+        "os": { "type": "string" },
+        "arch": { "type": "string" },
+        "release": { "type": "string" },
+        "node_version": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "gateway": {
+      "type": "object",
+      "required": ["name", "version"],
+      "properties": {
+        "name": { "const": "llm-cli-gateway" },
+        "version": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "transport": {
+      "type": "object",
+      "required": ["default", "http"],
+      "properties": {
+        "default": { "enum": ["stdio", "http"] },
+        "http": {
+          "type": "object",
+          "required": ["enabled", "host", "port", "path", "public_url_configured", "public_url"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "host": { "type": "string" },
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "path": { "type": "string" },
+            "public_url_configured": { "type": "boolean" },
+            "public_url": { "type": ["string", "null"] },
+            "chatgpt_connector_url": { "type": ["string", "null"] }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "auth": {
+      "type": "object",
+      "required": ["required", "token_configured", "source"],
+      "properties": {
+        "required": { "type": "boolean" },
+        "token_configured": { "type": "boolean" },
+        "source": { "enum": ["env", "disabled", "installer-auth-token-file"] },
+        "oauth": {
+          "type": "object",
+          "required": [
+            "enabled",
+            "registration_policy",
+            "clients_configured",
+            "shared_secret_enabled",
+            "pkce_required",
+            "issuer"
+          ],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "registration_policy": {
+              "enum": ["static_clients", "shared_secret", "open_dev"]
+            },
+            "clients_configured": { "type": "integer", "minimum": 0 },
+            "shared_secret_enabled": { "type": "boolean" },
+            "pkce_required": { "type": "boolean" },
+            "issuer": { "type": ["string", "null"] }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "workspaces": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "default",
+        "repo_count",
+        "allowed_root_count",
+        "gateway_app_dir_is_workspace"
+      ],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "default": { "type": ["string", "null"] },
+        "repo_count": { "type": "integer", "minimum": 0 },
+        "allowed_root_count": { "type": "integer", "minimum": 0 },
+        "gateway_app_dir_is_workspace": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "providers": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "cli_available",
+          "version",
+          "login_status",
+          "version_command",
+          "login_check",
+          "install_guidance",
+          "login_guidance"
+        ],
+        "properties": {
+          "cli_available": { "type": "boolean" },
+          "version": { "type": ["string", "null"] },
+          "login_status": {
+            "enum": ["authenticated", "not_authenticated", "unknown", "not_checked"]
+          },
+          "version_command": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "login_check": {
+            "type": "object",
+            "required": ["method", "command", "credential_store", "detail"],
+            "properties": {
+              "method": { "enum": ["cli", "credential_store", "not_checked"] },
+              "command": {
+                "type": ["array", "null"],
+                "items": { "type": "string" }
+              },
+              "credential_store": { "enum": ["present", "not_found", "not_checked"] },
+              "detail": { "type": "string" }
+            },
+            "additionalProperties": false
+          },
+          "install_guidance": {
+            "type": "object",
+            "required": ["summary", "commands"],
+            "properties": {
+              "summary": { "type": "string" },
+              "commands": {
+                "type": "array",
+                "items": { "type": "string" }
+              },
+              "documentation_url": { "type": "string" }
+            },
+            "additionalProperties": false
+          },
+          "login_guidance": {
+            "type": "object",
+            "required": ["summary", "commands", "credential_handling"],
+            "properties": {
+              "summary": { "type": "string" },
+              "commands": {
+                "type": "array",
+                "items": { "type": "string" }
+              },
+              "credential_handling": { "type": "string" }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "endpoint_exposure": {
+      "type": "object",
+      "required": [
+        "mode",
+        "local_url",
+        "public_url_configured",
+        "public_url",
+        "https_required_for_web",
+        "https_configured",
+        "web_clients_supported",
+        "tunnel_provider",
+        "reachable_from_web",
+        "verification",
+        "next_actions"
+      ],
+      "properties": {
+        "mode": {
+          "enum": ["local_only", "lan", "tunnel", "byo_reverse_proxy", "misconfigured"]
+        },
+        "local_url": { "type": "string" },
+        "public_url_configured": { "type": "boolean" },
+        "public_url": { "type": ["string", "null"] },
+        "https_required_for_web": { "type": "boolean" },
+        "https_configured": { "type": "boolean" },
+        "web_clients_supported": { "type": "boolean" },
+        "tunnel_provider": { "type": ["string", "null"] },
+        "reachable_from_web": { "enum": ["not_checked", "reachable", "unreachable"] },
+        "verification": {
+          "type": "object",
+          "required": ["method", "checked_url", "status_code", "error"],
+          "properties": {
+            "method": { "enum": ["not_checked", "http_head"] },
+            "checked_url": { "type": ["string", "null"] },
+            "status_code": { "type": ["integer", "null"] },
+            "error": { "type": ["string", "null"] }
+          },
+          "additionalProperties": false
+        },
+        "next_actions": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "remote_http_oauth": {
+      "type": "object",
+      "description": "Stable readiness projection for the preferred remote connector path (public HTTPS URL + /mcp + OAuth + registered/default workspace). Secret-free.",
+      "required": [
+        "ready",
+        "stage",
+        "public_url",
+        "mcp_url",
+        "auth_mode",
+        "oauth",
+        "workspace",
+        "next_actions"
+      ],
+      "properties": {
+        "ready": { "type": "boolean" },
+        "stage": {
+          "enum": [
+            "not_started",
+            "missing_public_url",
+            "endpoint_unreachable",
+            "oauth_disabled",
+            "unsafe_oauth_config",
+            "missing_oauth_client",
+            "missing_workspace",
+            "ready"
+          ]
+        },
+        "public_url": { "type": ["string", "null"] },
+        "mcp_url": { "type": ["string", "null"] },
+        "auth_mode": { "enum": ["oauth", "bearer_token", "none"] },
+        "oauth": {
+          "type": "object",
+          "required": [
+            "enabled",
+            "issuer",
+            "authorization_url",
+            "token_url",
+            "registration_policy",
+            "clients_configured",
+            "consent_required"
+          ],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "issuer": { "type": ["string", "null"] },
+            "authorization_url": { "type": ["string", "null"] },
+            "token_url": { "type": ["string", "null"] },
+            "registration_policy": {
+              "enum": ["static_clients", "shared_secret", "open_dev"]
+            },
+            "clients_configured": { "type": "integer", "minimum": 0 },
+            "consent_required": { "type": "boolean" }
+          },
+          "additionalProperties": false
+        },
+        "workspace": {
+          "type": "object",
+          "required": ["ready", "default", "aliases"],
+          "properties": {
+            "ready": { "type": "boolean" },
+            "default": { "type": ["string", "null"] },
+            "aliases": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          },
+          "additionalProperties": false
+        },
+        "next_actions": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "client_config": {
+      "type": "object",
+      "required": [
+        "claude_desktop_config_present",
+        "codex_config_present",
+        "gemini_settings_present",
+        "gemini_config",
+        "vibe_session_logging"
+      ],
+      "properties": {
+        "claude_desktop_config_present": { "type": "boolean" },
+        "codex_config_present": { "type": "boolean" },
+        "gemini_settings_present": { "type": "boolean" },
+        "gemini_config": {
+          "type": "object",
+          "required": [
+            "project_gemini_md_present",
+            "project_gemini_md_path",
+            "user_gemini_md_present",
+            "user_gemini_md_path",
+            "settings_json_present",
+            "settings_json_path",
+            "mcp_servers_registered",
+            "mcp_reconciliation",
+            "next_actions"
+          ],
+          "properties": {
+            "project_gemini_md_present": { "type": "boolean" },
+            "project_gemini_md_path": { "type": "string" },
+            "user_gemini_md_present": { "type": "boolean" },
+            "user_gemini_md_path": { "type": "string" },
+            "settings_json_present": { "type": "boolean" },
+            "settings_json_path": { "type": "string" },
+            "mcp_servers_registered": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "mcp_reconciliation": {
+              "type": "object",
+              "required": ["whitelisted", "missing_from_settings"],
+              "properties": {
+                "whitelisted": {
+                  "type": "array",
+                  "items": { "type": "string" }
+                },
+                "missing_from_settings": {
+                  "type": "array",
+                  "items": { "type": "string" }
+                }
+              },
+              "additionalProperties": false
+            },
+            "next_actions": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          },
+          "additionalProperties": false
+        },
+        "vibe_session_logging": {
+          "type": "object",
+          "required": [
+            "config_path",
+            "config_present",
+            "session_logging_enabled",
+            "note",
+            "kit_note"
+          ],
+          "properties": {
+            "config_path": { "type": "string" },
+            "config_present": { "type": "boolean" },
+            "session_logging_enabled": { "type": "boolean" },
+            "note": { "type": "string" },
+            "kit_note": {
+              "type": "string",
+              "description": "How this ambient setting relates to a Personal Agent Config Kit mistral turn, which runs under a redirected VIBE_HOME and never reads this file."
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "cache_awareness": {
+      "type": "object",
+      "required": ["enabled_features", "last_24h", "per_cli"],
+      "properties": {
+        "enabled_features": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["anthropic_cache_control", "ttl_warnings"]
+          }
+        },
+        "last_24h": {
+          "type": "object",
+          "required": ["hit_rate", "total_hits", "total_requests", "estimated_savings_usd"],
+          "properties": {
+            "hit_rate": { "type": "number" },
+            "total_hits": { "type": "integer" },
+            "total_requests": { "type": "integer" },
+            "estimated_savings_usd": { "type": "number" }
+          },
+          "additionalProperties": false
+        },
+        "per_cli": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["hit_rate", "total_hits", "total_cache_read_tokens"],
+            "properties": {
+              "hit_rate": { "type": "number" },
+              "total_hits": { "type": "integer" },
+              "total_cache_read_tokens": { "type": "integer" }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "provider_capabilities": {
+      "type": "object",
+      "required": ["schema_version", "tool", "resources", "cache_ttl_ms", "providers"],
+      "properties": {
+        "schema_version": { "const": "provider-tool-capabilities.v2" },
+        "tool": { "const": "provider_tool_capabilities" },
+        "resources": {
+          "type": "object",
+          "required": ["catalog", "providers"],
+          "properties": {
+            "catalog": { "const": "provider-tools://catalog" },
+            "providers": {
+              "type": "object",
+              "minProperties": 1,
+              "additionalProperties": { "type": "string" }
+            }
+          },
+          "additionalProperties": false
+        },
+        "cache_ttl_ms": { "type": "integer", "minimum": 0 },
+        "providers": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "object",
+            "required": [
+              "provider_kind",
+              "cli_available",
+              "gateway_request_tools",
+              "supported_features",
+              "unsupported_inputs",
+              "config_surface_count",
+              "discovered_skill_count",
+              "discovered_provider_tool_count",
+              "warnings"
+            ],
+            "properties": {
+              "provider_kind": { "enum": ["cli", "api"] },
+              "cli_available": { "type": "boolean" },
+              "gateway_request_tools": {
+                "type": "array",
+                "items": { "type": "string" }
+              },
+              "supported_features": {
+                "type": "array",
+                "items": { "type": "string" }
+              },
+              "unsupported_inputs": {
+                "type": "array",
+                "items": { "type": "string" }
+              },
+              "config_surface_count": { "type": "integer", "minimum": 0 },
+              "discovered_skill_count": { "type": "integer", "minimum": 0 },
+              "discovered_provider_tool_count": { "type": "integer", "minimum": 0 },
+              "warnings": {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "least_cost": {
+      "type": "object",
+      "description": "LCR phase_3: least-cost-routing eligibility summary. Economics-only and secret-free (model names, pricing families, price provenance, tiers, telemetry tiers, price-table staleness, anonymized calibration buckets). ALWAYS present; compact (empty arrays) when routing is disabled.",
+      "required": ["enabled", "pricing", "providers", "untieredModels", "calibrationQuality"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "pricing": {
+          "type": "object",
+          "required": ["tableAsOf", "apiCatalogAsOf", "staleDays"],
+          "properties": {
+            "tableAsOf": { "type": "string" },
+            "apiCatalogAsOf": { "type": "string" },
+            "staleDays": { "type": "integer", "minimum": 0 }
+          },
+          "additionalProperties": false
+        },
+        "providers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["provider", "telemetryTier", "candidates"],
+            "properties": {
+              "provider": { "type": "string" },
+              "telemetryTier": { "enum": ["T1", "T2", "T3", "T4"] },
+              "candidates": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["model", "family", "priced", "priceSource", "tier"],
+                  "properties": {
+                    "model": { "type": "string" },
+                    "family": { "type": "string" },
+                    "priced": { "type": "boolean" },
+                    "priceSource": { "enum": ["table", "api-catalog", "unknown"] },
+                    "tier": {
+                      "type": ["string", "null"],
+                      "enum": ["economy", "standard", "frontier", null]
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "untieredModels": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "calibrationQuality": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["bucket", "k", "samples", "confidence"],
+            "properties": {
+              "bucket": { "type": "string" },
+              "k": { "type": "number" },
+              "samples": { "type": "integer", "minimum": 0 },
+              "confidence": { "enum": ["high", "medium", "low"] }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "personal_config": {
+      "type": "object",
+      "description": "Secret-free local readiness for the optional Personal Agent Config Kit. durable_async_configured reflects resolved configuration only, not live store admission. claude_bare_auth_configured reports only whether the isolated Claude Kit credential is present. ready is the legacy aggregate view and still requires the Claude credential; provider_eligibility is authoritative per provider.",
+      "required": [
+        "enabled",
+        "configuration_valid",
+        "ready",
+        "claude_bare_auth_configured",
+        "baseline_present",
+        "current_release_id",
+        "last_success_at",
+        "stale",
+        "last_sync_error",
+        "durable_async_configured",
+        "provider_eligibility"
+      ],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "configuration_valid": { "type": "boolean" },
+        "ready": { "type": "boolean" },
+        "claude_bare_auth_configured": { "type": "boolean" },
+        "baseline_present": { "type": "boolean" },
+        "current_release_id": { "type": ["string", "null"] },
+        "last_success_at": { "type": ["string", "null"], "format": "date-time" },
+        "stale": { "type": "boolean" },
+        "last_sync_error": { "type": ["string", "null"] },
+        "durable_async_configured": { "type": "boolean" },
+        "provider_eligibility": {
+          "type": "object",
+          "description": "Kit eligibility for every CLI provider, keyed by provider id. kit_supported is a static registry fact; eligible additionally requires the Kit to be enabled and every precondition met. blockers names unmet preconditions and never carries a credential value or a local path.",
+          "additionalProperties": {
+            "type": "object",
+            "required": [
+              "kit_supported",
+              "eligible",
+              "isolation_model",
+              "required_credential_env",
+              "required_credential_configured",
+              "blockers"
+            ],
+            "properties": {
+              "kit_supported": { "type": "boolean" },
+              "eligible": { "type": "boolean" },
+              "isolation_model": {
+                "type": ["string", "null"],
+                "enum": ["bare-flag", "strip-ambient", "controlled-environment", null]
+              },
+              "required_credential_env": { "type": ["string", "null"] },
+              "required_credential_configured": { "type": "boolean" },
+              "blockers": { "type": "array", "items": { "type": "string" } }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "api_providers": {
+      "type": "object",
+      "description": "Slice 6: health of enabled [providers.<name>] (kind:api) providers. OMITTED entirely when none are enabled (dormant byte-identical).",
+      "required": ["enabled_count", "providers"],
+      "properties": {
+        "enabled_count": { "type": "integer", "minimum": 1 },
+        "providers": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": [
+              "name",
+              "kind",
+              "base_url",
+              "default_model",
+              "models",
+              "api_key_env",
+              "api_key_present",
+              "reachable",
+              "login_guidance"
+            ],
+            "properties": {
+              "name": { "type": "string" },
+              "kind": { "enum": ["openai-compatible", "anthropic", "xai-responses"] },
+              "base_url": { "type": "string" },
+              "default_model": { "type": "string" },
+              "models": {
+                "type": ["array", "null"],
+                "items": { "type": "string" }
+              },
+              "api_key_env": { "type": ["string", "null"] },
+              "api_key_present": { "type": "boolean" },
+              "reachable": { "type": ["boolean", "null"] },
+              "reachability_error": { "type": "string" },
+              "login_guidance": {
+                "type": "object",
+                "required": [
+                  "provider",
+                  "displayName",
+                  "kind",
+                  "baseUrl",
+                  "apiKeyEnv",
+                  "summary",
+                  "steps",
+                  "credentialHandling"
+                ],
+                "properties": {
+                  "provider": { "type": "string" },
+                  "displayName": { "type": "string" },
+                  "kind": { "enum": ["openai-compatible", "anthropic", "xai-responses"] },
+                  "baseUrl": { "type": "string" },
+                  "apiKeyEnv": { "type": ["string", "null"] },
+                  "summary": { "type": "string" },
+                  "steps": { "type": "array", "items": { "type": "string" } },
+                  "credentialHandling": { "type": "string" }
+                },
+                "additionalProperties": false
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "upstream": {
+      "type": "object",
+      "required": [
+        "note",
+        "recommendation",
+        "how_to_check",
+        "probed",
+        "installed_versions",
+        "version_guard",
+        "contracts"
+      ],
+      "properties": {
+        "note": { "type": "string" },
+        "recommendation": { "type": "string" },
+        "how_to_check": { "type": "string" },
+        "probed": { "type": "boolean" },
+        "installed_versions": {
+          "type": "object",
+          "additionalProperties": { "type": ["string", "null"] }
+        },
+        "version_guard": {
+          "type": "object",
+          "description": "Installed-versus-contracted provider version comparison. Offline: derived from installed_versions and PROVIDER_TARGET_VERSIONS, spawning nothing.",
+          "required": ["ok", "drifted", "not_installed", "unknown", "providers"],
+          "properties": {
+            "ok": { "type": "boolean" },
+            "drifted": { "type": "array", "items": { "type": "string" } },
+            "not_installed": { "type": "array", "items": { "type": "string" } },
+            "unknown": { "type": "array", "items": { "type": "string" } },
+            "providers": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "cli",
+                  "state",
+                  "installed",
+                  "target",
+                  "installedNormalized",
+                  "targetNormalized",
+                  "detail"
+                ],
+                "properties": {
+                  "cli": { "type": "string" },
+                  "state": {
+                    "type": "string",
+                    "enum": ["match", "drift", "not-installed", "unknown"]
+                  },
+                  "installed": { "type": ["string", "null"] },
+                  "target": { "type": "string" },
+                  "installedNormalized": { "type": "string" },
+                  "targetNormalized": { "type": "string" },
+                  "detail": { "type": "string" }
+                },
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "contracts": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "probe_report": {
+          "type": ["object", "null"],
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "next_actions": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "additionalProperties": false
+}

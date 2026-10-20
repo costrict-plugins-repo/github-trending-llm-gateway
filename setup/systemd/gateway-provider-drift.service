@@ -1,0 +1,30 @@
+[Unit]
+Description=llm-cli-gateway provider CLI contract drift check
+Documentation=https://github.com/verivus-oss/llm-cli-gateway/blob/main/scripts/provider-drift-check.sh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Reference unit: replace /path/to/llm-cli-gateway with your checkout before
+# installing. systemd does not expand environment variables in the executable
+# token, so this one path has to be edited rather than configured. The script
+# itself derives the repository from its own location, so nothing else needs
+# changing; set GATEWAY_DRIFT_REPO below only to point at a different checkout.
+ExecStart=/path/to/llm-cli-gateway/scripts/provider-drift-check.sh
+# report = detect and log only. Set to "apply" to additionally rebaseline in
+# place. `apply` covers version targets AND flag removals: the rebaseliner edits
+# the contract, the acknowledgements and the codegen tables in one run, and
+# fails closed with a residual-reference report if any emitter survives. A flag
+# the upstream dropped while the gateway still emits it is a live breakage, so
+# `report` mode still surfaces it for a human rather than acting.
+Environment=GATEWAY_DRIFT_MODE=report
+Nice=10
+# Probing seven CLIs plus a build; generous but bounded.
+TimeoutStartSec=900
+# 0 clean, 2 rebaselinable drift, 3 needs a human. Only 1 is a real failure,
+# so drift is reported without the unit going into a failed state on every run.
+SuccessExitStatus=0 2 3
+
+[Install]
+WantedBy=default.target

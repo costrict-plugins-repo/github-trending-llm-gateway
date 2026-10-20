@@ -1,0 +1,531 @@
+{
+  "schemaVersion": "upstream-scan-snapshot.v2",
+  "cli": "claude",
+  "fetchedAt": "2026-09-09T00:26:02.433Z",
+  "sources": [
+    {
+      "url": "https://code.claude.com/docs/en/changelog.md",
+      "ok": true,
+      "status": 200,
+      "bytes": 458866,
+      "sha256": "0feb935be08c7a8d05c92725348ea9302672e5e12d1d2d6622a7db3bb5b2cd87",
+      "semantic": null
+    }
+  ],
+  "helpSurface": {
+    "probedAt": "2026-09-09T00:26:02.432Z",
+    "available": true,
+    "version": "2.1.266 (Claude Code)",
+    "targetVersion": "claude 2.1.266",
+    "versionMatchesTarget": true,
+    "discoveredFlags": [
+      "--add-dir",
+      "--agent",
+      "--agents",
+      "--allow-dangerously-skip-permissions",
+      "--allowed",
+      "--allowed-tools",
+      "--append-system-prompt",
+      "--autocompact",
+      "--ax-screen-reader",
+      "--background",
+      "--bare",
+      "--betas",
+      "--bg",
+      "--brief",
+      "--chrome",
+      "--cloud",
+      "--continue",
+      "--dangerously-skip-permissions",
+      "--debug",
+      "--debug-file",
+      "--disable-slash-commands",
+      "--disallowed",
+      "--disallowed-tools",
+      "--effort",
+      "--environment",
+      "--exclude-dynamic-system-prompt-sections",
+      "--fallback-model",
+      "--file",
+      "--fork-session",
+      "--forward-subagent-text",
+      "--from-pr",
+      "--ide",
+      "--include-hook-events",
+      "--include-partial-messages",
+      "--input-format",
+      "--json-schema",
+      "--max-budget-usd",
+      "--mcp-config",
+      "--model",
+      "--name",
+      "--no-chrome",
+      "--no-session-persistence",
+      "--output-format",
+      "--permission-mode",
+      "--permission-prompt-tool",
+      "--permission-prompts",
+      "--plugin-dir",
+      "--plugin-url",
+      "--print",
+      "--prompt-suggestions",
+      "--remote-control",
+      "--remote-control-session-name-prefix",
+      "--replay-user-messages",
+      "--restricted",
+      "--resume",
+      "--safe-mode",
+      "--session-id",
+      "--setting-sources",
+      "--settings",
+      "--strict-mcp-config",
+      "--system-prompt",
+      "--system-prompt-snapshot",
+      "--teleport",
+      "--tmux",
+      "--tools",
+      "--verbose",
+      "--version",
+      "--worktree"
+    ],
+    "helpHash": "b020e981685e4997e56df1c263b2fafbe7a290616d26421ba74d900e23bca73c",
+    "extraVsContract": [],
+    "missingFromBinary": [],
+    "arityMismatches": [],
+    "enumMismatches": []
+  },
+  "rootCommands": [
+    "agents",
+    "attach",
+    "auth",
+    "auto-mode",
+    "doctor",
+    "gateway",
+    "import",
+    "install",
+    "kill",
+    "logs",
+    "mcp",
+    "plugin",
+    "plugins",
+    "project",
+    "respawn",
+    "rm",
+    "setup-token",
+    "stop",
+    "ultrareview",
+    "update",
+    "upgrade"
+  ],
+  "subcommands": {
+    "agents": {
+      "commandPath": [
+        "agents"
+      ],
+      "probedAt": "2026-09-09T00:26:00.578Z",
+      "available": true,
+      "existence": "present",
+      "discoveredFlags": [
+        "--add-dir",
+        "--agent",
+        "--all",
+        "--allow-dangerously-skip-permissions",
+        "--cwd",
+        "--dangerously-skip-permissions",
+        "--effort",
+        "--json",
+        "--mcp-config",
+        "--model",
+        "--permission-mode",
+        "--plugin-dir",
+        "--restricted",
+        "--setting-sources",
+        "--settings",
+        "--strict-mcp-config"
+      ],
+      "helpHash": "a1b8b9ef2f518a63f9283fa408cf9feff76254f35b5c2af9762d74cabccac967",
+      "extraVsContract": [],
+      "missingFromBinary": [],
+      "arityMismatches": [],
+      "enumMismatches": [],
+      "risk": "writes_local_config",
+      "exposure": "tracked_only",
+      "tier": "inspect",
+      "summary": "Inspect and manage Claude agent definitions."
+    },
+    "attach": {
+      "commandPath": [
+        "attach"
+      ],
+      "probedAt": "2026-09-09T00:26:00.710Z",
+      "available": true,
+      "existence": "present",
+      "discoveredFlags": [],
+      "helpHash": "bd7a426c7b80711863acdd00964ecc20d2a1bc4d24f334653a59d12d7d0df8c1",
+      "extraVsContract": [],
+      "missingFromBinary": [],
+      "arityMismatches": [],
+      "enumMismatches": [],
+      "risk": "writes_local_config",
+      "exposure": "tracked_only",
+      "tier": "catalog",
+      "summary": "Upstream-declared claude command (auto-catalogued, unverified)."
+    },
+    "auth": {
+      "commandPath": [
+        "auth"
+      ],
+      "probedAt": "2026-09-09T00:26:00.813Z",
+      "available": true,
+      "existence": "present",
+      "discoveredFlags": [],
+      "helpHash": "bc651a5ac897fc64c101365e18bf8b91514d5311178305375467cbc466f02972",
+      "extraVsContract": [],
+      "missingFromBinary": [],
+      "arityMismatches": [],
+      "enumMismatches": [],
+      "risk": "auth",
+      "exposure": "not_exposed",
+      "tier": "catalog",
+      "summary": "Manage Claude authentication state."
+    },
+    "auto-mode": {
+      "commandPath": [
+        "auto-mode"
+      ],
+      "probedAt": "2026-09-09T00:26:00.907Z",
+      "available": true,
+      "existence": "present",
+      "discoveredFlags": [],
+      "helpHash": "a77ea63f5376050eecaff169d7660abeb59c6b86c60976f126da288057689893",
+      "extraVsContract": [],
+      "missingFromBinary": [],
+      "arityMismatches": [],
+      "enumMismatches": [],
+      "risk": "writes_local_config",
+      "exposure": "tracked_only",
+      "tier": "catalog",
+      "summary": "Configure Claude auto-mode behavior."
+    },
+    "doctor": {
+      "commandPath": [
+        "doctor"
+      ],
+      "probedAt": "2026-09-09T00:26:00.988Z",
+      "available": true,
+      "existence": "present",
+      "discoveredFlags": [],
+      "helpHash": "765316f389fff84db3d64d74474d948f330eedd0b74bbb99c1a7b8975767ea6b",
+      "extraVsContract": [],
+      "missingFromBinary": [],
+      "arityMismatches": [],
+      "enumMismatches": [],
+      "risk": "read_only",
+      "exposure": "tracked_only",
+      "tier": "diagnostic",
+      "summary": "Run Claude Code diagnostic checks."
+    },
+    "gateway": {
+      "commandPath": [
+        "gateway"
+      ],
+      "probedAt": "2026-09-09T00:26:01.070Z",
+      "available": true,
+      "existence": "present",
+      "discoveredFlags": [
+        "--config"
+      ],
+      "helpHash": "2772d859320326d4b3277c088eea128e15cfa2babf8e508762823a84e652d4de",
+      "extraVsContract": [],
+      "missingFromBinary": [],
+      "arityMismatches": [],
+      "enumMismatches": [],
+      "risk": "starts_server",
+      "exposure": "not_exposed",
+      "tier": "catalog",
+      "summary": "Run Claude enterprise auth and telemetry gateway mode."
+    },
+    "import": {
+      "commandPath": [
+        "import"
+      ],
+      "probedAt": "2026-09-09T00:26:01.163Z",
+      "available": true,
+      "existence": "present",
+      "discoveredFlags": [
+        "--dry-run",
+        "--yes"
+      ],
+      "helpHash": "efa0b9ee4f10f6e6e8c54a6388429a71be145c7d2e8c503a0dda4bf319088200",
+      "extraVsContract": [],
+      "missingFromBinary": [],
+      "arityMismatches": [],
+      "enumMismatches": [],
+      "risk": "writes_local_config",
+      "exposure": "tracked_only",
+      "tier": "catalog",
+      "summary": "Upstream-declared claude command (auto-catalogued, unverified)."
+    },
+    "install": {
+      "commandPath": [
+        "install"
+      ],
+      "probedAt": "2026-09-09T00:26:01.255Z",
+      "available": true,
+      "existence": "present",
+      "discoveredFlags": [
+        "--force"
+      ],
+      "helpHash": "4ad9e987882643d5c22364af1644eefe711770936a8bb02f30315b980c40ec53",
+      "extraVsContract": [],
+      "missingFromBinary": [],
+      "arityMismatches": [],
+      "enumMismatches": [],
+      "risk": "writes_local_config",
+      "exposure": "not_exposed",
+      "tier": "catalog",
+      "summary": "Install Claude Code shell integrations."
+    },
+    "kill": {
+      "commandPath": [
+        "kill"
+      ],
+      "probedAt": "2026-09-09T00:26:01.351Z",
+      "available": true,
+      "existence": "present",
+      "discoveredFlags": [],
+      "helpHash": "a6ad5176891175d39dcf11d0ae113ad50c2925b1760021c494d5e9dad5bed6e7",
+      "extraVsContract": [],
+      "missingFromBinary": [],
+      "arityMismatches": [],
+      "enumMismatches": [],
+      "risk": "writes_local_config",
+      "exposure": "tracked_only",
+      "tier": "catalog",
+      "summary": "Upstream-declared claude command (auto-catalogued, unverified)."
+    },
+    "logs": {
+      "commandPath": [
+        "logs"
+      ],
+      "probedAt": "2026-09-09T00:26:01.451Z",
+      "available": true,
+      "existence": "present",
+      "discoveredFlags": [],
+      "helpHash": "bdf3aea935bd5663877f34dd88372164c703bc2052fd851d9d569c4aa646e1d4",
+      "extraVsContract": [],
+      "missingFromBinary": [],
+      "arityMismatches": [],
+      "enumMismatches": [],
+      "risk": "writes_local_config",
+      "exposure": "tracked_only",
+      "tier": "catalog",
+      "summary": "Upstream-declared claude command (auto-catalogued, unverified)."
+    },
+    "mcp": {
+      "commandPath": [
+        "mcp"
+      ],
+      "probedAt": "2026-09-09T00:26:01.539Z",
+      "available": true,
+      "existence": "present",
+      "discoveredFlags": [],
+      "helpHash": "eee6f66160ed93383d3538682951e7cfd2d1c976a1bdb6a0140d924d71996162",
+      "extraVsContract": [],
+      "missingFromBinary": [],
+      "arityMismatches": [],
+      "enumMismatches": [],
+      "risk": "writes_local_config",
+      "exposure": "tracked_only",
+      "tier": "catalog",
+      "summary": "Manage Claude MCP server configuration."
+    },
+    "plugin": {
+      "commandPath": [
+        "plugin"
+      ],
+      "probedAt": "2026-09-09T00:26:01.624Z",
+      "available": true,
+      "existence": "present",
+      "discoveredFlags": [],
+      "helpHash": "5a82e183a798691467659ceee1e429d5d83543abd291751c2b7a4b07d7cd44e5",
+      "extraVsContract": [],
+      "missingFromBinary": [],
+      "arityMismatches": [],
+      "enumMismatches": [],
+      "risk": "writes_local_config",
+      "exposure": "tracked_only",
+      "tier": "catalog",
+      "summary": "Manage Claude plugins."
+    },
+    "plugins": {
+      "commandPath": [
+        "plugins"
+      ],
+      "probedAt": "2026-09-09T00:26:01.705Z",
+      "available": true,
+      "existence": "present",
+      "discoveredFlags": [],
+      "helpHash": "5a82e183a798691467659ceee1e429d5d83543abd291751c2b7a4b07d7cd44e5",
+      "extraVsContract": [],
+      "missingFromBinary": [],
+      "arityMismatches": [],
+      "enumMismatches": [],
+      "risk": "writes_local_config",
+      "exposure": "tracked_only",
+      "tier": "catalog",
+      "summary": "Alias for Claude plugin management."
+    },
+    "project": {
+      "commandPath": [
+        "project"
+      ],
+      "probedAt": "2026-09-09T00:26:01.796Z",
+      "available": true,
+      "existence": "present",
+      "discoveredFlags": [],
+      "helpHash": "f11126e66a4726b498cd18098faeccb70bae06939f19da456f2f4453b481e1e3",
+      "extraVsContract": [],
+      "missingFromBinary": [],
+      "arityMismatches": [],
+      "enumMismatches": [],
+      "risk": "writes_local_config",
+      "exposure": "tracked_only",
+      "tier": "catalog",
+      "summary": "Manage Claude project configuration."
+    },
+    "respawn": {
+      "commandPath": [
+        "respawn"
+      ],
+      "probedAt": "2026-09-09T00:26:01.905Z",
+      "available": true,
+      "existence": "present",
+      "discoveredFlags": [],
+      "helpHash": "85e8283bbbedd7dc35c9a63ee2efcbc2d910d3ef32af6c1e5dca98b6ed80f424",
+      "extraVsContract": [],
+      "missingFromBinary": [],
+      "arityMismatches": [],
+      "enumMismatches": [],
+      "risk": "writes_local_config",
+      "exposure": "tracked_only",
+      "tier": "catalog",
+      "summary": "Upstream-declared claude command (auto-catalogued, unverified)."
+    },
+    "rm": {
+      "commandPath": [
+        "rm"
+      ],
+      "probedAt": "2026-09-09T00:26:02.002Z",
+      "available": true,
+      "existence": "present",
+      "discoveredFlags": [
+        "--discard-unpushed"
+      ],
+      "helpHash": "93a90188dfc75ac6e76c2dd7cd2ee8aa368f9a7443aed18394af00dd74a77e4c",
+      "extraVsContract": [],
+      "missingFromBinary": [],
+      "arityMismatches": [],
+      "enumMismatches": [],
+      "risk": "writes_local_config",
+      "exposure": "tracked_only",
+      "tier": "catalog",
+      "summary": "Upstream-declared claude command (auto-catalogued, unverified)."
+    },
+    "setup-token": {
+      "commandPath": [
+        "setup-token"
+      ],
+      "probedAt": "2026-09-09T00:26:02.088Z",
+      "available": true,
+      "existence": "present",
+      "discoveredFlags": [],
+      "helpHash": "b545e6f499482ee9854ed2a673686180f175b6d2151f56b300e7382b98c7efbc",
+      "extraVsContract": [],
+      "missingFromBinary": [],
+      "arityMismatches": [],
+      "enumMismatches": [],
+      "risk": "auth",
+      "exposure": "not_exposed",
+      "tier": "catalog",
+      "summary": "Configure Claude setup token authentication."
+    },
+    "stop": {
+      "commandPath": [
+        "stop"
+      ],
+      "probedAt": "2026-09-09T00:26:02.185Z",
+      "available": true,
+      "existence": "present",
+      "discoveredFlags": [],
+      "helpHash": "a6ad5176891175d39dcf11d0ae113ad50c2925b1760021c494d5e9dad5bed6e7",
+      "extraVsContract": [],
+      "missingFromBinary": [],
+      "arityMismatches": [],
+      "enumMismatches": [],
+      "risk": "writes_local_config",
+      "exposure": "tracked_only",
+      "tier": "catalog",
+      "summary": "Upstream-declared claude command (auto-catalogued, unverified)."
+    },
+    "ultrareview": {
+      "commandPath": [
+        "ultrareview"
+      ],
+      "probedAt": "2026-09-09T00:26:02.263Z",
+      "available": true,
+      "existence": "present",
+      "discoveredFlags": [
+        "--json",
+        "--no-post",
+        "--post",
+        "--timeout"
+      ],
+      "helpHash": "9c03d18bc57d2f97d3e96b2d2dabe577950e9ea5bbd6460de30c42ff55120c46",
+      "extraVsContract": [],
+      "missingFromBinary": [],
+      "arityMismatches": [],
+      "enumMismatches": [],
+      "risk": "executes_agent",
+      "exposure": "tracked_only",
+      "tier": "diagnostic",
+      "summary": "Run Claude ultrareview diagnostics."
+    },
+    "update": {
+      "commandPath": [
+        "update"
+      ],
+      "probedAt": "2026-09-09T00:26:02.348Z",
+      "available": true,
+      "existence": "present",
+      "discoveredFlags": [],
+      "helpHash": "48859a9514d9d28a94ad11638d5a1497ac55ab7e8930ee050576ee59ec3e087c",
+      "extraVsContract": [],
+      "missingFromBinary": [],
+      "arityMismatches": [],
+      "enumMismatches": [],
+      "risk": "updates_binary",
+      "exposure": "not_exposed",
+      "tier": "catalog",
+      "summary": "Update the Claude Code binary."
+    },
+    "upgrade": {
+      "commandPath": [
+        "upgrade"
+      ],
+      "probedAt": "2026-09-09T00:26:02.432Z",
+      "available": true,
+      "existence": "present",
+      "discoveredFlags": [],
+      "helpHash": "48859a9514d9d28a94ad11638d5a1497ac55ab7e8930ee050576ee59ec3e087c",
+      "extraVsContract": [],
+      "missingFromBinary": [],
+      "arityMismatches": [],
+      "enumMismatches": [],
+      "risk": "updates_binary",
+      "exposure": "not_exposed",
+      "tier": "catalog",
+      "summary": "Alias for updating the Claude Code binary."
+    }
+  }
+}

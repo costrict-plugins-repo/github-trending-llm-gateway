@@ -1,0 +1,408 @@
+#!/usr/bin/env node
+// Verify docs/plans/validation-launch-surface.dag.toml against the actual code.
+//
+// A map with stale declarations is worse than no map: it is a control that
+// cannot fail, in documentation form. The checker resolves named symbols and
+// quoted source evidence rather than persisting layout coordinates.
+//
+// Exit 0 clean, 1 on drift. Run: node scripts/check-launch-surface-dag.mjs
+
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { parse as parseToml } from "smol-toml";
+import ts from "typescript";
+
+export const DAG_PATH = "docs/plans/validation-launch-surface.dag.toml";
+
+const REQUIRED_COVERAGE = {
+  node_count: { label: "node", expected: 17 },
+  invariant_count: { label: "invariant", expected: 6 },
+  flow_count: { label: "flow hop", expected: 9 },
+};
+
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function nonemptyStrings(value) {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every(item => typeof item === "string" && item.length > 0)
+  );
+}
+
+function enclosingFunctionName(node) {
+  for (let current = node.parent; current; current = current.parent) {
+    if (ts.isFunctionDeclaration(current)) return current.name?.text ?? "<anonymous>";
+    if (ts.isMethodDeclaration(current)) return current.name?.getText() ?? "<anonymous>";
+    if (ts.isFunctionExpression(current) || ts.isArrowFunction(current)) {
+      if (ts.isVariableDeclaration(current.parent) && ts.isIdentifier(current.parent.name)) {
+        return current.parent.name.text;
+      }
+      if (ts.isPropertyAssignment(current.parent)) return current.parent.name.getText();
+      return "<anonymous>";
+    }
+  }
+  return "<top-level>";
+}
+
+function isTransparentExpression(parent, child) {
+  return (
+    parent.expression === child &&
+    (ts.isParenthesizedExpression(parent) ||
+      ts.isAsExpression(parent) ||
+      ts.isTypeAssertionExpression(parent) ||
+      ts.isNonNullExpression(parent) ||
+      ts.isSatisfiesExpression(parent) ||
+      ts.isPartiallyEmittedExpression(parent))
+  );
+}
+
+function containingDirectCall(identifier) {
+  let expression = identifier;
+  while (expression.parent && isTransparentExpression(expression.parent, expression)) {
+    expression = expression.parent;
+  }
+  const parent = expression.parent;
+  return parent && ts.isCallExpression(parent) && parent.expression === expression ? parent : null;
+}
+
+/**
+ * Protected launch symbols are lexically reserved in the orchestrator. Their
+ * declaration and direct call sites are the only allowed identifier uses.
+ * Rejecting every other reference is deliberately conservative: an alias,
+ * `.call`, `.apply`, `.bind`, comma expression, or shadowing declaration could
+ * otherwise create an executable path that a bare CallExpression count misses.
+ */
+function analyzeProtectedSymbol(sourceText, fileName, symbol) {
+  const sourceFile = ts.createSourceFile(fileName, sourceText, ts.ScriptTarget.Latest, true);
+  const callers = [];
+  const unexpectedReferences = [];
+  let declarations = 0;
+  const visit = node => {
+    if (ts.isIdentifier(node) && node.text === symbol) {
+      if (ts.isFunctionDeclaration(node.parent) && node.parent.name === node) {
+        declarations++;
+      } else {
+        const call = containingDirectCall(node);
+        if (call) {
+          callers.push(enclosingFunctionName(call));
+        } else {
+          unexpectedReferences.push({
+            syntax: node.parent.getText(sourceFile).replaceAll(/\s+/g, " ").slice(0, 100),
+          });
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return { callers, declarations, unexpectedReferences };
+}
+
+function countNamedNodeDeclarations(sourceText, fileName, kind, symbol) {
+  const sourceFile = ts.createSourceFile(fileName, sourceText, ts.ScriptTarget.Latest, true);
+  let count = 0;
+  const visit = node => {
+    if (kind === "mcp_tool" && ts.isCallExpression(node)) {
+      const callee = node.expression;
+      const method = ts.isPropertyAccessExpression(callee) ? callee.name.text : "";
+      const first = node.arguments[0];
+      if (
+        (method === "tool" || method === "registerTool") &&
+        first &&
+        ts.isStringLiteralLike(first) &&
+        first.text === symbol
+      ) {
+        count++;
+      }
+    } else if (
+      kind === "function" &&
+      ts.isFunctionDeclaration(node) &&
+      node.name?.text === symbol
+    ) {
+      count++;
+    } else if (
+      kind === "durable_schema" &&
+      ts.isVariableDeclaration(node) &&
+      ts.isIdentifier(node.name) &&
+      node.name.text === symbol
+    ) {
+      count++;
+    } else if (
+      kind === "durable_field" &&
+      ts.isPropertyAssignment(node) &&
+      ((ts.isIdentifier(node.name) && node.name.text === symbol) ||
+        (ts.isStringLiteralLike(node.name) && node.name.text === symbol))
+    ) {
+      count++;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return count;
+}
+
+function sortedUnique(values) {
+  return [...new Set(values)].sort();
+}
+
+function sameStrings(left, right) {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+/** Preserve source layout while making comment text unavailable as evidence. */
+function withoutComments(sourceText) {
+  const chars = sourceText.split("");
+  const sourceFile = ts.createSourceFile(
+    "flow-evidence.ts",
+    sourceText,
+    ts.ScriptTarget.Latest,
+    true
+  );
+  const ranges = new Map();
+  const collect = range => {
+    if (range) ranges.set(`${range.pos}:${range.end}`, range);
+  };
+  const visit = node => {
+    for (const range of ts.getLeadingCommentRanges(sourceText, node.getFullStart()) ?? []) {
+      collect(range);
+    }
+    for (const range of ts.getTrailingCommentRanges(sourceText, node.getEnd()) ?? []) {
+      collect(range);
+    }
+    for (const child of node.getChildren(sourceFile)) visit(child);
+  };
+  visit(sourceFile);
+  for (const range of ranges.values()) {
+    for (let index = range.pos; index < range.end; index += 1) {
+      if (chars[index] !== "\n" && chars[index] !== "\r") chars[index] = " ";
+    }
+  }
+  return chars.join("");
+}
+
+/**
+ * Check the launch-surface map and return every problem instead of exiting.
+ * Tests inject a temporary root so fail-open mutations exercise this exact code.
+ */
+export function checkLaunchSurfaceDag({ rootDir = process.cwd(), dagPath = DAG_PATH } = {}) {
+  const problems = [];
+  const fileCache = new Map();
+  const absolute = relative => path.resolve(rootDir, relative);
+  const readSource = relative => {
+    if (!fileCache.has(relative)) {
+      try {
+        fileCache.set(relative, fs.readFileSync(absolute(relative), "utf8"));
+      } catch (error) {
+        problems.push(`${relative}: cannot read source (${error.message})`);
+        fileCache.set(relative, "");
+      }
+    }
+    return fileCache.get(relative);
+  };
+
+  let document;
+  try {
+    document = parseToml(fs.readFileSync(absolute(dagPath), "utf8"));
+  } catch (error) {
+    return {
+      problems: [`${dagPath}: invalid or unreadable TOML (${error.message})`],
+      nodesChecked: 0,
+      invariantsChecked: 0,
+      flowsChecked: 0,
+    };
+  }
+
+  if (!isRecord(document.meta)) problems.push("meta: missing table");
+  const nodes = Array.isArray(document.node) ? document.node : [];
+  const invariants = Array.isArray(document.invariant) ? document.invariant : [];
+  const flowCount = nodes.reduce(
+    (count, node) => count + (isRecord(node) && Array.isArray(node.flow) ? node.flow.length : 0),
+    0
+  );
+  const actualCounts = {
+    node_count: nodes.length,
+    invariant_count: invariants.length,
+    flow_count: flowCount,
+  };
+  for (const [key, coverage] of Object.entries(REQUIRED_COVERAGE)) {
+    const declared = document.meta?.[key];
+    if (!Number.isInteger(declared)) {
+      problems.push(`meta.${key}: missing integer coverage declaration`);
+    } else if (declared !== coverage.expected) {
+      problems.push(`meta.${key}: must remain ${coverage.expected}, declared ${declared}`);
+    }
+    if (actualCounts[key] !== coverage.expected) {
+      problems.push(
+        `coverage ${key}: requires ${coverage.expected} ${coverage.label}(s), parsed ${actualCounts[key]}`
+      );
+    }
+  }
+
+  const nodeIds = new Set();
+  let nodesChecked = 0;
+  let flowsChecked = 0;
+  for (const [index, node] of nodes.entries()) {
+    const label = `node[${index}]`;
+    if (!isRecord(node)) {
+      problems.push(`${label}: must be a table`);
+      continue;
+    }
+    for (const field of ["id", "kind", "file", "symbol", "role"]) {
+      if (typeof node[field] !== "string" || node[field].length === 0) {
+        problems.push(`${label}.${field}: missing non-empty string`);
+      }
+    }
+    if (Object.hasOwn(node, "line")) {
+      problems.push(`${label}: layout coordinates are forbidden; use symbol`);
+    }
+    if (!nonemptyStrings(node.affects))
+      problems.push(`${label}.affects: missing non-empty string list`);
+    if (typeof node.id === "string") {
+      if (nodeIds.has(node.id)) problems.push(`${label}.id: duplicate ${node.id}`);
+      nodeIds.add(node.id);
+    }
+    if (
+      typeof node.id !== "string" ||
+      typeof node.file !== "string" ||
+      typeof node.symbol !== "string"
+    ) {
+      continue;
+    }
+    nodesChecked++;
+    const declarationCount = countNamedNodeDeclarations(
+      readSource(node.file),
+      node.file,
+      node.kind,
+      node.symbol
+    );
+    if (declarationCount !== 1) {
+      problems.push(
+        `${node.id}: ${node.file} must declare named symbol "${node.symbol}" exactly once; found ${declarationCount}`
+      );
+    }
+
+    if (node.kind === "durable_field") {
+      if (!Array.isArray(node.flow) || node.flow.length === 0) {
+        problems.push(`${node.id}.flow: missing non-empty structured flow`);
+        continue;
+      }
+      for (const [flowIndex, hop] of node.flow.entries()) {
+        const hopLabel = `${node.id}.flow[${flowIndex}]`;
+        if (!isRecord(hop)) {
+          problems.push(`${hopLabel}: must be a table with file, evidence, and role`);
+          continue;
+        }
+        for (const field of ["file", "evidence", "role"]) {
+          if (typeof hop[field] !== "string" || hop[field].length === 0) {
+            problems.push(`${hopLabel}.${field}: missing non-empty string`);
+          }
+        }
+        if (Object.hasOwn(hop, "line")) {
+          problems.push(`${hopLabel}: layout coordinates are forbidden; use quoted evidence`);
+        }
+        if (typeof hop.file !== "string" || typeof hop.evidence !== "string") {
+          continue;
+        }
+        flowsChecked++;
+        if (!withoutComments(readSource(hop.file)).includes(hop.evidence)) {
+          problems.push(`${hopLabel}: ${hop.file} no longer carries "${hop.evidence}"`);
+        }
+      }
+    } else if (Object.hasOwn(node, "flow")) {
+      problems.push(`${node.id}.flow: only durable_field nodes may declare a flow`);
+    }
+  }
+
+  const invariantSymbols = new Set();
+  let invariantsChecked = 0;
+  const orchestratorFile = "src/validation-orchestrator.ts";
+  const orchestratorSource = readSource(orchestratorFile);
+  for (const [index, invariant] of invariants.entries()) {
+    const label = `invariant[${index}]`;
+    if (!isRecord(invariant)) {
+      problems.push(`${label}: must be a table`);
+      continue;
+    }
+    for (const field of ["symbol", "why"]) {
+      if (typeof invariant[field] !== "string" || invariant[field].length === 0) {
+        problems.push(`${label}.${field}: missing non-empty string`);
+      }
+    }
+    if (!Number.isInteger(invariant.callers) || invariant.callers < 0) {
+      problems.push(`${label}.callers: missing non-negative integer`);
+    }
+    if (!nonemptyStrings(invariant.expect)) {
+      problems.push(`${label}.expect: missing non-empty string list`);
+    }
+    if (typeof invariant.symbol === "string") {
+      if (invariantSymbols.has(invariant.symbol)) {
+        problems.push(`${label}.symbol: duplicate ${invariant.symbol}`);
+      }
+      invariantSymbols.add(invariant.symbol);
+    }
+    if (
+      typeof invariant.symbol !== "string" ||
+      !Number.isInteger(invariant.callers) ||
+      !nonemptyStrings(invariant.expect)
+    ) {
+      continue;
+    }
+    invariantsChecked++;
+    const analysis = analyzeProtectedSymbol(orchestratorSource, orchestratorFile, invariant.symbol);
+    const actualCallers = analysis.callers;
+    const actualIdentities = sortedUnique(actualCallers);
+    const expectedIdentities = sortedUnique(invariant.expect);
+    if (analysis.declarations !== 1) {
+      problems.push(
+        `invariant ${invariant.symbol}: expected one protected function declaration, found ${analysis.declarations}`
+      );
+    }
+    for (const reference of analysis.unexpectedReferences) {
+      problems.push(
+        `invariant ${invariant.symbol}: unsupported reference in ${orchestratorFile} (${reference.syntax})`
+      );
+    }
+    if (actualCallers.length !== invariant.callers) {
+      problems.push(
+        `invariant ${invariant.symbol}: DAG says ${invariant.callers} call(s), source has ${actualCallers.length}`
+      );
+    }
+    if (!sameStrings(actualIdentities, expectedIdentities)) {
+      problems.push(
+        `invariant ${invariant.symbol}: expected callers [${expectedIdentities.join(", ")}], found [${actualIdentities.join(", ")}]`
+      );
+    }
+  }
+
+  return { problems, nodesChecked, invariantsChecked, flowsChecked };
+}
+
+export function isDirectInvocation(metaUrl, argv1) {
+  if (!argv1) return false;
+  try {
+    return fs.realpathSync(fileURLToPath(metaUrl)) === fs.realpathSync(argv1);
+  } catch {
+    return false;
+  }
+}
+
+if (isDirectInvocation(import.meta.url, process.argv[1])) {
+  const result = checkLaunchSurfaceDag();
+  console.log(
+    `checked ${result.nodesChecked} nodes, ${result.invariantsChecked} invariants, ${result.flowsChecked} flow hops`
+  );
+  if (result.problems.length === 0) {
+    console.log("launch-surface DAG matches the code");
+    process.exit(0);
+  }
+  console.error("\nlaunch-surface DAG has drifted from the code:\n");
+  for (const problem of result.problems) console.error(`  - ${problem}`);
+  console.error(
+    "\nThe DAG is the map used to decide what a change affects. Fix the code or the map, but do not leave them disagreeing."
+  );
+  process.exit(1);
+}

@@ -1,0 +1,87 @@
+# typos config — consumed by crate-ci/typos in
+# .github/workflows/security.yml at the "Source-code spellcheck" step.
+#
+# Scope: catch genuine typos in normative surfaces (src/, scripts/,
+# README/CHANGELOG/BEST_PRACTICES). Skip non-normative surfaces where
+# "wrong" words are intentional (Markdown research notes, fixtures,
+# vendored content, build artefacts).
+
+[default]
+extend-ignore-identifiers-re = [
+  # Treat tokens containing a digit, dash, or underscore as identifiers
+  # and skip them entirely (covers model names, env-var names, MCP tool
+  # names that typos would otherwise mis-split, e.g.
+  # `claude-sonnet-4-5`, `LLM_GATEWAY_LOGS_DB`).
+  "^[A-Z][A-Za-z0-9_-]+$",
+  "^[a-z][a-z0-9_-]*$",
+  # Git commit hashes in provider version banners start with a digit, so the
+  # two identifier patterns above (which require a leading letter) do not cover
+  # them, and typos word-splits a hash and flags any dictionary-shaped run
+  # inside it, e.g. `caf` inside the cursor build hash `6caf4ff`. Skip any
+  # lowercase-hex token of git-hash length. Recurs on every release that lands
+  # a new build hash.
+  "^[0-9a-f]{7,40}$",
+]
+
+[default.extend-words]
+# Vendor / product names that look typo-shaped.
+Mistral = "Mistral"
+mistral = "mistral"
+Anthropic = "Anthropic"
+anthropic = "anthropic"
+# Cryptographic / standards acronyms.
+COSE = "COSE"
+# CLI / library short names that typos doesn't recognise.
+gtwy = "gtwy"           # mcp gateway short name
+sqry = "sqry"           # AST search tool
+exa  = "exa"            # web search tool
+NDJSON = "NDJSON"
+# Deliberate term: the `invokableSubcommand` surface field (camelCase, so it is
+# not covered by the lowercase identifier regex) and the "not invokable" prose.
+invokable = "invokable"
+
+[files]
+extend-exclude = [
+  # Build outputs and lockfiles — typos doesn't usefully check these.
+  "dist/**",
+  "node_modules/**",
+  "**/package-lock.json",
+  "integrations/llm-plugin/dist/**",
+  "integrations/llm-plugin/*.egg-info/**",
+
+  # Test fixtures and golden files — intentionally contain odd strings.
+  "src/__tests__/**/*.json",
+  "src/__tests__/**/*.toml",
+  "src/__tests__/fixtures/**",
+
+  # Long-form research / docs trees where "wrong" words are intentional
+  # (anti-pattern dictionaries, historical incident logs, etc.).
+  "docs/archive/**",
+  "docs/personal-mcp/**",
+  "docs/reviews/**",
+  # In-flight design drafts and review logs (per CLAUDE.md): narrative notes
+  # full of correlation ids, hashes, and quoted model output where "wrong"
+  # tokens are intentional (e.g. a hex correlation-id fragment like 25c2b6ba
+  # that typos splits and flags as "ba"). Matches docs/reviews and docs/archive.
+  "docs/plans/**",
+  "DOGFOODING_*.md",
+  "RELEASE_NOTES_*.md",
+
+  # supply-chain-guard ledger: per-dependency contracts plus verbatim captured
+  # upstream evidence (OSV records, npm registry documents, SLSA attestation
+  # bundles, upstream patches). Spell-correcting captured evidence would destroy
+  # its value as evidence, and the identifiers in it are opaque by nature: this
+  # exclusion was added after `typos` flagged `mch` inside the OSV advisory id
+  # `CGA-2cm6-q4c4-8mch`. Every future advisory capture would re-trip it.
+  "docs/development/supply-chain-guard/ledger/**",
+
+  # CHANGELOG accumulates words verbatim from commit subjects and may
+  # legitimately echo whatever the contributor typed; running typos here
+  # would force CHANGELOG history rewrites on every false-positive.
+  "CHANGELOG.md",
+
+  # Vendored / local-only.
+  ".sqry/**",
+  ".sqry-cache/**",
+  ".preexisting-doctor-index.patch.bak",
+]

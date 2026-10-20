@@ -1,0 +1,854 @@
+import { describe, it, expect } from "vitest";
+import {
+  AsyncJobManager,
+  isAsyncJobInProgress,
+  type AsyncJobFlightRecorderEntry,
+  type AsyncJobUsageExtractor,
+  type LlmCli,
+} from "../async-job-manager.js";
+import { MemoryJobStore } from "../job-store.js";
+import { noopLogger } from "../logger.js";
+import type { JobLimitsConfig } from "../config.js";
+import type { FlightLogStart, FlightLogResult, FlightRecorderLike } from "../flight-recorder.js";
+
+/**
+ * Slice 1.5 — async-path flight-recorder tests.
+ *
+ * These tests use the CapturingFlightRecorder pattern from
+ * prompt-parts-tool-wiring.test.ts:106-117 and spawn tiny `node -e ...`
+ * children for terminal-state exercises.
+ */
+
+interface CapturedComplete {
+  correlationId: string;
+  result: FlightLogResult;
+}
+
+class CapturingFlightRecorder implements FlightRecorderLike {
+  starts: FlightLogStart[] = [];
+  completes: CapturedComplete[] = [];
+  async logStart(entry: FlightLogStart): Promise<void> {
+    this.starts.push(entry);
+  }
+  async logComplete(correlationId: string, result: FlightLogResult): Promise<void> {
+    this.completes.push({ correlationId, result });
+  }
+  async readCacheRowsBySession(): Promise<[]> {
+    return [];
+  }
+  async readCacheRowsByPrefix(): Promise<[]> {
+    return [];
+  }
+  async readCacheRowsGlobal(): Promise<[]> {
+    return [];
+  }
+  async readRequestById(): Promise<null> {
+    return null;
+  }
+  async listRequestSummaries(): Promise<[]> {
+    return [];
+  }
+  async readLcrPriorRows(): Promise<[]> {
+    return [];
+  }
+  async readRoutingDecisions(): Promise<[]> {
+    return [];
+  }
+  async flush(): Promise<void> {}
+  async close(): Promise<void> {}
+}
+
+/**
+ * Variant that REJECTS on the first logComplete then succeeds (Codex-F4).
+ *
+ * s7: it used to THROW synchronously, and a synchronous throw is caught by the
+ * manager's try whether or not the call is awaited. The real recorder rejects
+ * now, so the fake has to as well, or this test cannot see the dead-catch
+ * class it exists to guard: an await placed outside the try leaves the catch
+ * unreachable and `flightRecorderComplete` set on a write that failed, which
+ * disarms the very retry asserted below.
+ */
+class FlakyOnceFlightRecorder implements FlightRecorderLike {
+  starts: FlightLogStart[] = [];
+  completes: CapturedComplete[] = [];
+  private threwOnce = false;
+  async logStart(entry: FlightLogStart): Promise<void> {
+    this.starts.push(entry);
+  }
+  async logComplete(correlationId: string, result: FlightLogResult): Promise<void> {
+    if (!this.threwOnce) {
+      this.threwOnce = true;
+      throw new Error("flaky FR write");
+    }
+    this.completes.push({ correlationId, result });
+  }
+  async readCacheRowsBySession(): Promise<[]> {
+    return [];
+  }
+  async readCacheRowsByPrefix(): Promise<[]> {
+    return [];
+  }
+  async readCacheRowsGlobal(): Promise<[]> {
+    return [];
+  }
+  async readRequestById(): Promise<null> {
+    return null;
+  }
+  async listRequestSummaries(): Promise<[]> {
+    return [];
+  }
+  async readLcrPriorRows(): Promise<[]> {
+    return [];
+  }
+  async readRoutingDecisions(): Promise<[]> {
+    return [];
+  }
+  async flush(): Promise<void> {}
+  async close(): Promise<void> {}
+}
+
+function waitForJobDone(manager: AsyncJobManager, jobId: string, timeoutMs = 5000): Promise<void> {
+  return new Promise(async (resolve, reject) => {
+    const deadline = Date.now() + timeoutMs;
+    const check = async () => {
+      const s = await manager.getJobSnapshot(jobId);
+      if (s && !isAsyncJobInProgress(s.status)) return resolve();
+      if (Date.now() > deadline) return reject(new Error("waitForJobDone timed out"));
+      setTimeout(check, 50);
+    };
+    await check();
+  });
+}
+
+/** Small delay to allow the close handler to flush after a status transition. */
+function tick(ms = 80): Promise<void> {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+/** Helper: minimal flightRecorderEntry. */
+function entry(overrides: Partial<AsyncJobFlightRecorderEntry> = {}): AsyncJobFlightRecorderEntry {
+  return {
+    model: "test-model",
+    prompt: "assembled prompt",
+    sessionId: "sess-X",
+    stablePrefixHash: "deadbeef",
+    stablePrefixTokens: 42,
+    ...overrides,
+  };
+}
+
+const fakeUsage: AsyncJobUsageExtractor = () => ({
+  inputTokens: 100,
+  outputTokens: 50,
+  cacheReadTokens: 25,
+  cacheCreationTokens: 0,
+  costUsd: 0.001,
+});
+
+function limiterLimits(overrides: Partial<JobLimitsConfig> = {}): JobLimitsConfig {
+  return {
+    maxRunningJobs: 1,
+    maxRunningJobsPerProvider: 1,
+    maxQueuedJobs: 5,
+    queueTimeoutMs: 10_000,
+    completedJobMemoryTtlMs: 60 * 60 * 1000,
+    maxJobOutputBytes: 50 * 1024 * 1024,
+    ...overrides,
+  };
+}
+
+describe("AsyncJobManager + flight-recorder (slice 1.5)", () => {
+  describe("logStart opt-in (case a / a2 / i)", () => {
+    it("writes logStart with asyncJobId+stablePrefixHash when writeFlightStart=true", async () => {
+      const fr = new CapturingFlightRecorder();
+      const manager = new AsyncJobManager(noopLogger, undefined, new MemoryJobStore(), fr);
+      const outcome = await manager.startJobWithDedup("claude" as LlmCli, ["nothing"], "corr-a", {
+        writeFlightStart: true,
+        flightRecorderEntry: entry(),
+        extractUsage: fakeUsage,
+      });
+      try {
+        await waitForJobDone(manager, outcome.snapshot.id);
+      } catch {
+        /* spawn may fail for unknown CLI; that's fine for this assertion */
+      }
+      const start = fr.starts.find(s => s.correlationId === "corr-a");
+      expect(start).toBeDefined();
+      expect(start!.asyncJobId).toBe(outcome.snapshot.id);
+      expect(start!.stablePrefixHash).toBe("deadbeef");
+      expect(start!.stablePrefixTokens).toBe(42);
+      expect(start!.cli).toBe("claude");
+      expect(start!.model).toBe("test-model");
+    });
+
+    it("does NOT write logStart when writeFlightStart=false (sync-deferred regression for Codex-F1)", async () => {
+      const fr = new CapturingFlightRecorder();
+      const manager = new AsyncJobManager(noopLogger, undefined, new MemoryJobStore(), fr);
+      const outcome = await manager.startJobWithDedup(
+        "echo" as LlmCli,
+        ["hello-sync-deferred"],
+        "corr-a2",
+        {
+          writeFlightStart: false,
+          flightRecorderEntry: entry(),
+          extractUsage: fakeUsage,
+        }
+      );
+      // R2 Codex-Unit-B F1: arm before terminal so the manager owns the
+      // logComplete write the way awaitJobOrDefer does when it defers.
+      manager.armFlightCompleteForDeferral(outcome.snapshot.id);
+      await waitForJobDone(manager, outcome.snapshot.id);
+      await tick();
+      await manager.whenPendingWritesSettled();
+      expect(fr.starts).toHaveLength(0);
+      // ...and logComplete fires (manager covers the sync handler's row).
+      expect(fr.completes).toHaveLength(1);
+      expect(fr.completes[0].correlationId).toBe("corr-a2");
+      expect(fr.completes[0].result.status).toBe("completed");
+    });
+
+    it("does NOT write logComplete when writeFlightStart=false and not armed (sync-inline regression for Codex-Unit-B F1)", async () => {
+      // Sync-inline scenario: sync handler will write its own
+      // safeFlightComplete with rich metadata. Manager MUST stay silent or
+      // the rich row is preempted by the manager's minimal payload.
+      const fr = new CapturingFlightRecorder();
+      const manager = new AsyncJobManager(noopLogger, undefined, new MemoryJobStore(), fr);
+      const outcome = await manager.startJobWithDedup(
+        "echo" as LlmCli,
+        ["hello-sync-inline"],
+        "corr-a3",
+        {
+          writeFlightStart: false,
+          flightRecorderEntry: entry(),
+          extractUsage: fakeUsage,
+        }
+      );
+      await waitForJobDone(manager, outcome.snapshot.id);
+      await tick();
+      await manager.whenPendingWritesSettled();
+      expect(fr.starts).toHaveLength(0);
+      expect(fr.completes).toHaveLength(0);
+    });
+
+    it("armFlightCompleteForDeferral after job already terminal still writes (race mitigation)", async () => {
+      const fr = new CapturingFlightRecorder();
+      const manager = new AsyncJobManager(noopLogger, undefined, new MemoryJobStore(), fr);
+      const outcome = await manager.startJobWithDedup("echo" as LlmCli, ["fast"], "corr-a4", {
+        writeFlightStart: false,
+        flightRecorderEntry: entry(),
+        extractUsage: fakeUsage,
+      });
+      await waitForJobDone(manager, outcome.snapshot.id);
+      await tick();
+      // Arm AFTER terminal — race mitigation should write logComplete now.
+      manager.armFlightCompleteForDeferral(outcome.snapshot.id);
+      await manager.whenPendingWritesSettled();
+      expect(fr.completes).toHaveLength(1);
+      expect(fr.completes[0].correlationId).toBe("corr-a4");
+    });
+
+    it("armFlightCompleteForDeferral while queued waits for a terminal transition", async () => {
+      const fr = new CapturingFlightRecorder();
+      const manager = new AsyncJobManager(
+        noopLogger,
+        undefined,
+        new MemoryJobStore(),
+        fr,
+        limiterLimits()
+      );
+      const running = await manager.startJobWithDedup("sleep" as LlmCli, ["2"], "corr-running");
+      const queued = await manager.startJobWithDedup("echo" as LlmCli, ["queued"], "corr-queued", {
+        writeFlightStart: false,
+        flightRecorderEntry: entry(),
+        extractUsage: fakeUsage,
+      });
+
+      expect((await manager.getJobSnapshot(queued.snapshot.id))?.status).toBe("queued");
+      manager.armFlightCompleteForDeferral(queued.snapshot.id);
+      expect(fr.completes).toHaveLength(0);
+
+      await manager.cancelJob(running.snapshot.id);
+      await waitForJobDone(manager, queued.snapshot.id);
+      await tick();
+      await manager.whenPendingWritesSettled();
+      expect(fr.completes).toHaveLength(1);
+      expect(fr.completes[0].correlationId).toBe("corr-queued");
+      expect(fr.completes[0].result.status).toBe("completed");
+    });
+
+    it("writes nothing when flightRecorderEntry is omitted (regression guard for case i)", async () => {
+      const fr = new CapturingFlightRecorder();
+      const manager = new AsyncJobManager(noopLogger, undefined, new MemoryJobStore(), fr);
+      const outcome = await manager.startJobWithDedup("echo" as LlmCli, ["silent"], "corr-i");
+      await waitForJobDone(manager, outcome.snapshot.id);
+      expect(fr.starts).toHaveLength(0);
+      expect(fr.completes).toHaveLength(0);
+    });
+  });
+
+  describe("logComplete on terminal states", () => {
+    it("clean exit (exitCode=0) → status='completed' + usage populated (case b)", async () => {
+      const fr = new CapturingFlightRecorder();
+      const manager = new AsyncJobManager(noopLogger, undefined, new MemoryJobStore(), fr);
+      const outcome = await manager.startJobWithDedup("echo" as LlmCli, ["clean-b"], "corr-b", {
+        writeFlightStart: true,
+        flightRecorderEntry: entry(),
+        extractUsage: fakeUsage,
+      });
+      await waitForJobDone(manager, outcome.snapshot.id);
+      const c = fr.completes.find(x => x.correlationId === "corr-b");
+      expect(c).toBeDefined();
+      expect(c!.result.status).toBe("completed");
+      expect(c!.result.inputTokens).toBe(100);
+      expect(c!.result.outputTokens).toBe(50);
+      expect(c!.result.cacheReadTokens).toBe(25);
+      expect(c!.result.costUsd).toBe(0.001);
+    });
+
+    it("non-zero exit with job.error=null falls back to stderr / 'Exit code N' (Codex-F2)", async () => {
+      const fr = new CapturingFlightRecorder();
+      const manager = new AsyncJobManager(noopLogger, undefined, new MemoryJobStore(), fr);
+      const outcome = await manager.startJobWithDedup(
+        "sh" as LlmCli,
+        ["-c", "echo trouble >&2; exit 7"],
+        "corr-c",
+        {
+          writeFlightStart: true,
+          flightRecorderEntry: entry(),
+          extractUsage: fakeUsage,
+        }
+      );
+      await waitForJobDone(manager, outcome.snapshot.id);
+      const c = fr.completes.find(x => x.correlationId === "corr-c");
+      expect(c).toBeDefined();
+      expect(c!.result.status).toBe("failed");
+      expect(c!.result.exitCode).toBe(7);
+      // job.error is null on a clean non-zero exit; falls back to stderr.
+      expect(c!.result.errorMessage).toContain("trouble");
+    });
+
+    it("launch failure populates errorMessage from launch-error text (Codex-F2)", async () => {
+      const fr = new CapturingFlightRecorder();
+      const manager = new AsyncJobManager(noopLogger, undefined, new MemoryJobStore(), fr);
+      const outcome = await manager.startJobWithDedup(
+        "missing-cli-for-fr-test" as LlmCli,
+        [],
+        "corr-c2",
+        {
+          writeFlightStart: true,
+          flightRecorderEntry: entry(),
+          extractUsage: fakeUsage,
+        }
+      );
+      await waitForJobDone(manager, outcome.snapshot.id);
+      const c = fr.completes.find(x => x.correlationId === "corr-c2");
+      expect(c).toBeDefined();
+      expect(c!.result.status).toBe("failed");
+      expect(c!.result.exitCode).toBe(127);
+      expect(c!.result.errorMessage).toContain("command was not found");
+    });
+
+    it("cancelJob → status='failed' + errorMessage='canceled by caller' (case d)", async () => {
+      const fr = new CapturingFlightRecorder();
+      const manager = new AsyncJobManager(noopLogger, undefined, new MemoryJobStore(), fr);
+      const outcome = await manager.startJobWithDedup("sleep" as LlmCli, ["10"], "corr-d", {
+        writeFlightStart: true,
+        flightRecorderEntry: entry(),
+        extractUsage: fakeUsage,
+      });
+      await manager.cancelJob(outcome.snapshot.id);
+      await waitForJobDone(manager, outcome.snapshot.id);
+      await tick();
+      const c = fr.completes.find(x => x.correlationId === "corr-d");
+      expect(c).toBeDefined();
+      expect(c!.result.status).toBe("failed");
+      expect(c!.result.errorMessage).toBe("canceled by caller");
+    }, 10000);
+
+    it("idle timeout → status='failed' + errorMessage contains 'inactivity' (case e)", async () => {
+      const fr = new CapturingFlightRecorder();
+      const manager = new AsyncJobManager(noopLogger, undefined, new MemoryJobStore(), fr);
+      const outcome = await manager.startJobWithDedup("sleep" as LlmCli, ["10"], "corr-e", {
+        idleTimeoutMs: 200,
+        writeFlightStart: true,
+        flightRecorderEntry: entry(),
+        extractUsage: fakeUsage,
+      });
+      await waitForJobDone(manager, outcome.snapshot.id, 8000);
+      await tick();
+      const c = fr.completes.find(x => x.correlationId === "corr-e");
+      expect(c).toBeDefined();
+      expect(c!.result.status).toBe("failed");
+      expect(c!.result.exitCode).toBe(125);
+      expect(c!.result.errorMessage).toContain("inactivity");
+    }, 15000);
+
+    it("dedup hit → second call writes no new logStart/logComplete (case f)", async () => {
+      const fr = new CapturingFlightRecorder();
+      const manager = new AsyncJobManager(noopLogger, undefined, new MemoryJobStore(), fr);
+      // Long-running job so the second call dedups onto it while still running.
+      const first = await manager.startJobWithDedup("sleep" as LlmCli, ["1"], "corr-f1", {
+        writeFlightStart: true,
+        flightRecorderEntry: entry(),
+        extractUsage: fakeUsage,
+      });
+      const second = await manager.startJobWithDedup("sleep" as LlmCli, ["1"], "corr-f2", {
+        writeFlightStart: true,
+        flightRecorderEntry: entry(),
+        extractUsage: fakeUsage,
+      });
+      expect(second.deduped).toBe(true);
+      expect(second.snapshot.id).toBe(first.snapshot.id);
+      await waitForJobDone(manager, first.snapshot.id, 5000);
+      await tick();
+      // Only ONE row total per logStart/logComplete (the original job's).
+      const starts = fr.starts.filter(s => s.correlationId === "corr-f1");
+      expect(starts).toHaveLength(1);
+      expect(fr.starts.find(s => s.correlationId === "corr-f2")).toBeUndefined();
+      expect(fr.completes.filter(c => c.correlationId === "corr-f1")).toHaveLength(1);
+      expect(fr.completes.find(c => c.correlationId === "corr-f2")).toBeUndefined();
+    }, 10000);
+  });
+
+  describe("orphan recovery on constructor (cases g + h, Mistral-F1)", () => {
+    it("seeded running rows produce one logComplete each, status='failed', 'orphaned'", async () => {
+      const fr = new CapturingFlightRecorder();
+      const store = new MemoryJobStore();
+      const startedAt = new Date(Date.now() - 60000).toISOString();
+      await store.recordStart({
+        id: "orph-1",
+        correlationId: "corr-orph-1",
+        requestKey: "k-orph-1",
+        cli: "claude",
+        args: ["--noop"],
+        startedAt,
+        pid: 999,
+      });
+      // The MemoryJobStore in v1.7.0 onwards keeps its no-op semantics for
+      // markOrphanedOnStartup (returns {count:0, orphaned:[]}), so this seed
+      // row will NOT be flipped on construction. Use the sqlite-backed
+      // assertions for the real orphan path; here we cover the contract that
+      // memory's no-op produces zero FR writes.
+      await new AsyncJobManager(noopLogger, undefined, store, fr).whenStartupSettled();
+      expect(fr.completes).toHaveLength(0);
+    });
+
+    it("no in-flight rows → zero logComplete calls (case h)", async () => {
+      const fr = new CapturingFlightRecorder();
+      const store = new MemoryJobStore();
+      await new AsyncJobManager(noopLogger, undefined, store, fr).whenStartupSettled();
+      expect(fr.completes).toHaveLength(0);
+    });
+
+    it("orphan path: captured stdout is not logged as a provider failure", async () => {
+      const fr = new CapturingFlightRecorder();
+      const startedAt = new Date(Date.now() - 30000).toISOString();
+      // #139: the ctor now runs the durable lease sweep (recoverStaleJobs) at
+      // startup, not the deprecated markOrphanedOnStartup. This mock returns the
+      // orphaned rows the sweep would have found so the FR-orphan-readback path
+      // is exercised unchanged.
+      const orphanRows = [
+        {
+          id: "j1",
+          correlationId: "corr-j1",
+          startedAt,
+          stdout: "partial-out",
+          stderr: "",
+          exitCode: null,
+          transport: "process" as const,
+          httpStatus: null,
+        },
+        {
+          id: "j2",
+          correlationId: "corr-j2",
+          startedAt,
+          stdout: "",
+          stderr: "boom",
+          exitCode: 137,
+          transport: "process" as const,
+          httpStatus: null,
+        },
+        {
+          id: "j3",
+          correlationId: "corr-j3",
+          startedAt,
+          stdout: "partial-before-explicit-failure",
+          stderr: "",
+          exitCode: 2,
+          transport: "process" as const,
+          httpStatus: null,
+        },
+        {
+          id: "j4",
+          correlationId: "corr-j4",
+          startedAt,
+          stdout: "complete-before-restart",
+          stderr: "",
+          exitCode: 0,
+          transport: "process" as const,
+          httpStatus: null,
+        },
+      ];
+      const fakeStore = {
+        registerInstance: () => {},
+        heartbeat: () => ({ instanceRowRefreshed: true, jobLeasesAdvanced: 0 }),
+        deregisterInstance: () => {},
+        gcInstances: () => 0,
+        selectStaleProcessCandidates: () => [],
+        recoverStaleJobs: () => orphanRows,
+        markRunning: () => {},
+        markOrphanedOnStartup: () => ({ count: orphanRows.length, orphaned: orphanRows }),
+        recordStart: () => {},
+        recordOutput: () => true,
+        recordComplete: () => {},
+        getById: () => null,
+        findByRequestKey: () => null,
+        evictExpired: () => 0,
+        close: async () => {},
+      };
+      await new AsyncJobManager(
+        noopLogger,
+        undefined,
+        fakeStore as unknown as MemoryJobStore,
+        fr
+      ).whenStartupSettled();
+      expect(fr.completes).toHaveLength(4);
+      const c1 = fr.completes.find(c => c.correlationId === "corr-j1");
+      expect(c1?.result.status).toBe("completed");
+      expect(c1?.result.errorMessage).toBeUndefined();
+      expect(c1?.result.response).toBe("partial-out");
+      expect(c1?.result.exitCode).toBe(0); // stdout with no recorded failure is output-intact
+      const c2 = fr.completes.find(c => c.correlationId === "corr-j2");
+      expect(c2?.result.status).toBe("failed");
+      expect(c2?.result.response).toBe("boom"); // stderr wins
+      expect(c2?.result.exitCode).toBe(137);
+      expect(c2?.result.errorMessage).toBe("orphaned after gateway restart");
+      const c3 = fr.completes.find(c => c.correlationId === "corr-j3");
+      expect(c3?.result.status).toBe("failed");
+      expect(c3?.result.response).toBe("partial-before-explicit-failure");
+      expect(c3?.result.exitCode).toBe(2);
+      const c4 = fr.completes.find(c => c.correlationId === "corr-j4");
+      expect(c4?.result.status).toBe("completed");
+      expect(c4?.result.errorMessage).toBeUndefined();
+      expect(c4?.result.response).toBe("complete-before-restart");
+      expect(c4?.result.exitCode).toBe(0);
+      // durationMs derived from seeded startedAt
+      expect(c1?.result.durationMs).toBeGreaterThanOrEqual(29000);
+    });
+
+    it("does not replay raw legacy Kit output into the flight recorder during recovery", async () => {
+      const fr = new CapturingFlightRecorder();
+      const startedAt = new Date(Date.now() - 30000).toISOString();
+      const privateOutput = "PRIVATE_LEGACY_KIT_ORPHAN_SENTINEL";
+      // A historical or partially upgraded row can still contain provider
+      // output even though modern Kit writes suppress it. Recovery must use
+      // the durable Kit marker, rather than trusting stdout/stderr to be safe.
+      const orphanRows = [
+        {
+          id: "legacy-kit-orphan",
+          correlationId: "corr-legacy-kit-orphan",
+          startedAt,
+          stdout: privateOutput,
+          stderr: `${privateOutput}-stderr`,
+          exitCode: 137,
+          transport: "process" as const,
+          httpStatus: null,
+          isPersonalConfigKit: true,
+        },
+      ];
+      const fakeStore = {
+        registerInstance: () => {},
+        heartbeat: () => ({ instanceRowRefreshed: true, jobLeasesAdvanced: 0 }),
+        deregisterInstance: () => {},
+        gcInstances: () => 0,
+        selectStaleProcessCandidates: () => [],
+        recoverStaleJobs: () => orphanRows,
+        markRunning: () => {},
+        markOrphanedOnStartup: () => ({ count: orphanRows.length, orphaned: orphanRows }),
+        recordStart: () => {},
+        recordOutput: () => true,
+        recordComplete: () => {},
+        getById: () => null,
+        findByRequestKey: () => null,
+        evictExpired: () => 0,
+        close: async () => {},
+      };
+
+      await new AsyncJobManager(
+        noopLogger,
+        undefined,
+        fakeStore as unknown as MemoryJobStore,
+        fr
+      ).whenStartupSettled();
+
+      const completion = fr.completes.find(
+        entry => entry.correlationId === "corr-legacy-kit-orphan"
+      );
+      expect(completion?.result.status).toBe("failed");
+      expect(completion?.result.response).toContain("output is withheld");
+      expect(completion?.result.errorMessage).toContain("detailed output is withheld");
+      expect(JSON.stringify(completion?.result)).not.toContain(privateOutput);
+    });
+  });
+
+  describe("retryability + closure clearing (cases j + k, Codex-F4 + F5)", () => {
+    it("Codex-F4: thrown logComplete leaves flag false; later terminal callback retries successfully", async () => {
+      const fr = new FlakyOnceFlightRecorder();
+      const manager = new AsyncJobManager(noopLogger, undefined, new MemoryJobStore(), fr);
+      // Use an idle-timeout job so the timeout cb fires first (and throws on
+      // the first logComplete attempt), then the child's close handler
+      // retries the logComplete which succeeds the second time.
+      const outcome = await manager.startJobWithDedup("sleep" as LlmCli, ["10"], "corr-j", {
+        idleTimeoutMs: 200,
+        writeFlightStart: true,
+        flightRecorderEntry: entry(),
+        extractUsage: fakeUsage,
+      });
+      await waitForJobDone(manager, outcome.snapshot.id, 8000);
+      // Allow enough time for the close handler to run after the SIGTERM/SIGKILL
+      // from the idle-timeout, so the retry can land.
+      await tick(300);
+      const matches = fr.completes.filter(c => c.correlationId === "corr-j");
+      // Exactly one successful write — the retry succeeded after the first throw.
+      expect(matches).toHaveLength(1);
+      expect(matches[0].result.status).toBe("failed");
+    }, 15000);
+
+    it("Codex-F5: post-write clear releases flightRecorderEntry + extractUsage", async () => {
+      const fr = new CapturingFlightRecorder();
+      const manager = new AsyncJobManager(noopLogger, undefined, new MemoryJobStore(), fr);
+      const outcome = await manager.startJobWithDedup("echo" as LlmCli, ["clear-k"], "corr-k", {
+        writeFlightStart: true,
+        flightRecorderEntry: entry(),
+        extractUsage: fakeUsage,
+      });
+      await waitForJobDone(manager, outcome.snapshot.id);
+      await tick();
+      // Run an eviction sweep to make sure no extra logComplete writes happen
+      // even when the in-memory record is still alive. If the post-write
+      // clear didn't fire, a stale extractUsage closure could plausibly cause
+      // an over-write. We assert exactly one complete row.
+      const matches = fr.completes.filter(c => c.correlationId === "corr-k");
+      expect(matches).toHaveLength(1);
+    });
+  });
+
+  describe("dead-process eviction (case e3, Codex-F6 / Gemini-Unit-B F5)", () => {
+    it("dead-process detected by eviction sweep → logComplete with 'Process no longer exists' errorMessage", async () => {
+      const fr = new CapturingFlightRecorder();
+      const manager = new AsyncJobManager(noopLogger, undefined, new MemoryJobStore(), fr);
+      // Directly seed a job record that points at a definitely-dead pid so
+      // process.kill(pid, 0) throws ESRCH in the eviction sweep's
+      // dead-process check. This isolates the eviction branch — exercising
+      // it via a real spawn races with the close handler.
+      const internal = manager as unknown as {
+        jobs: Map<string, Record<string, unknown>>;
+        evictCompletedJobs(): Promise<void>;
+      };
+      const corrId = "corr-e3";
+      const jobId = "fake-dead-job-e3";
+      const deadPid = 0x7fffffff; // huge pid that won't exist
+      internal.jobs.set(jobId, {
+        id: jobId,
+        cli: "claude",
+        args: [],
+        requestKey: "rk-e3",
+        correlationId: corrId,
+        status: "running",
+        startedAt: new Date().toISOString(),
+        finishedAt: null,
+        exitCode: null,
+        stdout: "",
+        stderr: "",
+        outputTruncated: false,
+        canceled: false,
+        error: null,
+        process: {
+          pid: deadPid,
+          stdout: null,
+          stderr: null,
+          on() {},
+        },
+        exited: false,
+        metricsRecorded: false,
+        outputDirty: false,
+        lastOutputFlushAt: Date.now(),
+        flightRecorderEntry: entry(),
+        extractUsage: fakeUsage,
+        flightRecorderComplete: false,
+        flightCompleteArmed: true,
+      });
+      await internal.evictCompletedJobs();
+      const c = fr.completes.find(x => x.correlationId === corrId);
+      expect(c).toBeDefined();
+      expect(c!.result.status).toBe("failed");
+      expect(c!.result.errorMessage).toBe("Process no longer exists (dead process detected)");
+    });
+  });
+
+  describe("output overflow (case e2, Codex-F6)", () => {
+    it("output overflow → status='failed' + errorMessage='Output exceeded maximum size (50MB)'", async () => {
+      const fr = new CapturingFlightRecorder();
+      const manager = new AsyncJobManager(noopLogger, undefined, new MemoryJobStore(), fr);
+      // Exercise the overflow branch directly instead of streaming 55MB
+      // through a shell pipeline; the latter is needlessly brittle on
+      // hosted CI runners and can leave cleanup work racing the test runner.
+      const internal = manager as unknown as {
+        jobs: Map<string, Record<string, unknown>>;
+        appendOutput(
+          job: Record<string, unknown>,
+          stream: "stdout" | "stderr",
+          chunk: Buffer
+        ): Promise<void>;
+      };
+      const jobId = "fake-overflow-job-e2";
+      const job: Record<string, unknown> = {
+        id: jobId,
+        cli: "claude",
+        args: [],
+        requestKey: "rk-e2",
+        correlationId: "corr-e2",
+        status: "running",
+        startedAt: new Date().toISOString(),
+        finishedAt: null,
+        exitCode: null,
+        stdout: "x".repeat(50 * 1024 * 1024),
+        stderr: "",
+        outputTruncated: false,
+        canceled: false,
+        error: null,
+        process: null,
+        exited: false,
+        metricsRecorded: false,
+        outputDirty: false,
+        lastOutputFlushAt: Date.now(),
+        flightRecorderEntry: entry(),
+        extractUsage: fakeUsage,
+        flightRecorderComplete: false,
+        flightCompleteArmed: true,
+        clearIdleTimer: () => {},
+      };
+      internal.jobs.set(jobId, job);
+      await internal.appendOutput(job, "stdout", Buffer.from("!"));
+      const c = fr.completes.find(x => x.correlationId === "corr-e2");
+      expect(c).toBeDefined();
+      expect(c!.result.status).toBe("failed");
+      expect(c!.result.errorMessage).toBe("Output exceeded maximum size (50MB)");
+    });
+  });
+});
+
+describe("AsyncJobManager — provider sessionId + stopReason (phase 7)", () => {
+  const GROK_JSON = JSON.stringify({
+    text: "hi",
+    stopReason: "stop",
+    sessionId: "grok-uuid-7777",
+    requestId: "req-1",
+  });
+
+  function seedCompletedGrokJob(manager: AsyncJobManager, jobId: string): Record<string, unknown> {
+    const internal = manager as unknown as { jobs: Map<string, Record<string, unknown>> };
+    const job: Record<string, unknown> = {
+      id: jobId,
+      cli: "grok",
+      args: [],
+      requestKey: "rk-grok",
+      correlationId: "corr-grok-p7",
+      status: "completed",
+      startedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+      exitCode: 0,
+      stdout: GROK_JSON,
+      stderr: "",
+      outputTruncated: false,
+      canceled: false,
+      error: null,
+      process: null,
+      transport: "process",
+      abort: null,
+      httpStatus: null,
+      exited: true,
+      metricsRecorded: true,
+      outputFormat: "json",
+      outputDirty: false,
+      lastOutputFlushAt: Date.now(),
+      flightRecorderEntry: entry(),
+      flightCompleteArmed: true,
+      flightRecorderComplete: false,
+    };
+    internal.jobs.set(jobId, job);
+    return job;
+  }
+
+  it("getJobResult surfaces the provider sessionId + stopReason parsed from stdout", async () => {
+    const fr = new CapturingFlightRecorder();
+    const manager = new AsyncJobManager(noopLogger, undefined, new MemoryJobStore(), fr);
+    seedCompletedGrokJob(manager, "job-grok-1");
+    const result = await manager.getJobResult("job-grok-1");
+    // Mutation that flips this red: not calling extractProviderOutputMetadata in
+    // getJobResult (a deferred grok job would then lose the id needed to resume).
+    expect(result?.providerSessionId).toBe("grok-uuid-7777");
+    expect(result?.stopReason).toBe("stop");
+  });
+
+  it("a REJECTED logComplete leaves the flag false so the next callback retries", async () => {
+    // s7's dead-catch control. `flightRecorderComplete` means "the row was
+    // written". The write is now a promise, so with the await outside the try
+    // the catch is unreachable AND the flag is set on a write that failed,
+    // which silently disarms this retry. Driven with closeObserved = true so
+    // the flag would really be reached on the first attempt.
+    const fr = new FlakyOnceFlightRecorder();
+    const manager = new AsyncJobManager(noopLogger, undefined, new MemoryJobStore(), fr);
+    const job = seedCompletedGrokJob(manager, "job-reject-retry");
+    job.closeObserved = true;
+    const write = manager as unknown as {
+      writeFlightComplete(j: unknown, s: string): void;
+    };
+
+    write.writeFlightComplete(job, "completed");
+    await manager.whenPendingWritesSettled();
+    expect(fr.completes).toHaveLength(0);
+    expect(job.flightRecorderComplete).toBe(false);
+    expect(job.flightRecorderEntry).toBeDefined();
+
+    write.writeFlightComplete(job, "completed");
+    await manager.whenPendingWritesSettled();
+    expect(fr.completes).toHaveLength(1);
+    expect(job.flightRecorderComplete).toBe(true);
+  });
+
+  it("writeFlightComplete persists providerSessionId + stopReason to logComplete", async () => {
+    const fr = new CapturingFlightRecorder();
+    const manager = new AsyncJobManager(noopLogger, undefined, new MemoryJobStore(), fr);
+    const job = seedCompletedGrokJob(manager, "job-grok-2");
+    (
+      manager as unknown as { writeFlightComplete(j: unknown, s: string): void }
+    ).writeFlightComplete(job, "completed");
+    // s7: the write is enqueued on the job's terminal chain, so it is no longer
+    // observable in the same tick.
+    await manager.whenPendingWritesSettled();
+    const c = fr.completes.find(x => x.correlationId === "corr-grok-p7");
+    // Mutation that flips this red: dropping providerSessionId/stopReason from
+    // the logComplete payload in writeFlightComplete.
+    expect(c?.result.providerSessionId).toBe("grok-uuid-7777");
+    expect(c?.result.stopReason).toBe("stop");
+  });
+
+  it("persists failed process metadata for remote persisted-result redaction", async () => {
+    const fr = new CapturingFlightRecorder();
+    const manager = new AsyncJobManager(noopLogger, undefined, new MemoryJobStore(), fr);
+    const job = seedCompletedGrokJob(manager, "job-grok-failed");
+    job.status = "failed";
+    job.exitCode = 1;
+    (
+      manager as unknown as { writeFlightComplete(j: unknown, s: string): void }
+    ).writeFlightComplete(job, "failed");
+    await manager.whenPendingWritesSettled();
+    const c = fr.completes.find(x => x.correlationId === "corr-grok-p7");
+    expect(c?.result.status).toBe("failed");
+    // Native continuation remains non-resumable to callers, but the private
+    // recorder must retain the known id so remote llm_request_result can scrub
+    // it without parsing response text.
+    expect(c?.result.providerSessionId).toBe("grok-uuid-7777");
+  });
+});

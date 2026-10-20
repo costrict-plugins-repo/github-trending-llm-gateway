@@ -1,0 +1,128 @@
+/*
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: camera=(), microphone=(), geolocation=()
+  Content-Security-Policy: default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' https://static.cloudflareinsights.com; connect-src 'self' https://cloudflareinsights.com; base-uri 'self'; form-action 'none'; frame-ancestors 'none'
+
+/
+  Cache-Control: public, max-age=0, must-revalidate
+
+/index.html
+  Cache-Control: public, max-age=0, must-revalidate
+
+/*.html
+  Cache-Control: public, max-age=0, must-revalidate
+
+/robots.txt
+  Content-Type: text/plain; charset=utf-8
+
+/3a9d0d7145a50e273758cb63918b496f.txt
+  Content-Type: text/plain; charset=utf-8
+
+/googleb0dea30e179d1a8e.html
+  Content-Type: text/html; charset=utf-8
+
+/install
+  Content-Type: text/html; charset=utf-8
+  Cache-Control: public, max-age=300, must-revalidate
+
+/docs
+  Content-Type: text/html; charset=utf-8
+  Cache-Control: public, max-age=300, must-revalidate
+
+/api
+  Content-Type: text/html; charset=utf-8
+  Cache-Control: public, max-age=300, must-revalidate
+
+/developers
+  Content-Type: text/html; charset=utf-8
+  Cache-Control: public, max-age=300, must-revalidate
+
+/about
+  Content-Type: text/html; charset=utf-8
+  Cache-Control: public, max-age=300, must-revalidate
+
+/contact
+  Content-Type: text/html; charset=utf-8
+  Cache-Control: public, max-age=300, must-revalidate
+
+/privacy
+  Content-Type: text/html; charset=utf-8
+  Cache-Control: public, max-age=300, must-revalidate
+
+/openapi.json
+  Content-Type: application/vnd.oai.openapi+json; charset=utf-8
+  Cache-Control: public, max-age=300, must-revalidate
+
+/sitemap.xml
+  Content-Type: application/xml; charset=utf-8
+  Cache-Control: public, max-age=300, must-revalidate
+
+/install.md
+  Content-Type: text/markdown; charset=utf-8
+  Cache-Control: public, max-age=300, must-revalidate
+
+/agents.md
+  Content-Type: text/markdown; charset=utf-8
+  Cache-Control: public, max-age=300, must-revalidate
+
+/tools.md
+  Content-Type: text/markdown; charset=utf-8
+  Cache-Control: public, max-age=300, must-revalidate
+
+/workflows/*.md
+  Content-Type: text/markdown; charset=utf-8
+  Cache-Control: public, max-age=300, must-revalidate
+
+/guides/*.md
+  Content-Type: text/markdown; charset=utf-8
+  Cache-Control: public, max-age=300, must-revalidate
+
+/DISCOVERY.md
+  Content-Type: text/markdown; charset=utf-8
+  Cache-Control: public, max-age=300, must-revalidate
+
+/llms.txt
+  Content-Type: text/plain; charset=utf-8
+  Cache-Control: public, max-age=300, must-revalidate
+
+/sitemap.md
+  Content-Type: text/markdown; charset=utf-8
+  Cache-Control: public, max-age=300, must-revalidate
+
+/.well-known/agent.json
+  Content-Type: application/json; charset=utf-8
+  Cache-Control: public, max-age=300, must-revalidate
+
+/agent.json
+  Content-Type: application/json; charset=utf-8
+  Cache-Control: public, max-age=300, must-revalidate
+
+/.well-known/integrations.json
+  Content-Type: application/json; charset=utf-8
+  Cache-Control: public, max-age=300, must-revalidate
+
+/.well-known/api-catalog
+  Content-Type: application/linkset+json; charset=utf-8
+  Cache-Control: public, max-age=300, must-revalidate
+
+/.well-known/ai-catalog.json
+  Content-Type: application/json; charset=utf-8
+  Cache-Control: public, max-age=300, must-revalidate
+
+/.well-known/mcp/server-card.json
+  Content-Type: application/json; charset=utf-8
+  Cache-Control: public, max-age=300, must-revalidate
+
+/.well-known/mcp.json
+  Content-Type: application/json; charset=utf-8
+  Cache-Control: public, max-age=300, must-revalidate
+
+/fonts/*
+  Cache-Control: public, max-age=31536000, immutable
+
+/images/*
+  Cache-Control: public, max-age=31536000, immutable
+
+/js/*
+  Cache-Control: public, max-age=31536000, immutable

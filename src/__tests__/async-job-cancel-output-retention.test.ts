@@ -1,0 +1,431 @@
+import { mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { AsyncJobManager, type LlmCli } from "../async-job-manager.js";
+import { readPersistedRequest } from "../cache-stats.js";
+import { FlightRecorder } from "../flight-recorder.js";
+import { SqliteJobStore, type JobStore } from "../job-store.js";
+
+/** Poll until predicate returns true, or reject after timeoutMs. */
+function waitFor(
+  fn: () => boolean | Promise<boolean>,
+  timeoutMs: number,
+  intervalMs = 25
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + timeoutMs;
+    const check = async () => {
+      if (await fn()) return resolve();
+      if (Date.now() > deadline) return reject(new Error("waitFor timed out"));
+      setTimeout(() => void check(), intervalMs);
+    };
+    void check();
+  });
+}
+
+/**
+ * Build a child that writes `early` immediately, then nothing until it is asked
+ * to stop, at which point it flushes `late` and exits. This models every
+ * provider CLI that accumulates its answer and writes it in one burst on
+ * shutdown (mistral/vibe, cursor, devin) rather than streaming as it goes
+ * (codex, claude).
+ *
+ * Deliberately node rather than a shell `trap`. A POSIX shell only runs a trap
+ * once the current foreground command finishes, so a `sleep` loop adds latency
+ * that races the gateway's 5s SIGKILL escalation on a loaded CI runner. Node
+ * handles the signal immediately, and the write callback guarantees the bytes
+ * are flushed before exit rather than truncated by it.
+ */
+function flushOnSigtermArgs(early: string, late: string): string[] {
+  return [
+    "-e",
+    `process.on("SIGTERM", () => { process.stdout.write(${JSON.stringify(late)}, () => process.exit(0)); });` +
+      `process.stdout.write(${JSON.stringify(early)});` +
+      `setInterval(() => {}, 1000);`,
+  ];
+}
+
+const FLUSH_ON_SIGTERM = flushOnSigtermArgs("EARLY_BYTES", "LATE_FLUSH_MARKER");
+const DELAYED_FLUSH_ON_SIGTERM = [
+  "-e",
+  `process.on("SIGTERM", () => { setTimeout(() => { process.stdout.write("LATE_FLUSH_MARKER", () => process.exit(0)); }, 500); });` +
+    `process.stdout.write("EARLY_BYTES");` +
+    `setInterval(() => {}, 1000);`,
+];
+
+describe("recordComplete reports whether the completion guard admitted the write", () => {
+  let tempDir: string;
+  let store: JobStore;
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "ajm-record-complete-"));
+    store = new SqliteJobStore(join(tempDir, "jobs.db"));
+  });
+
+  afterEach(async () => {
+    try {
+      await store.close();
+    } catch {
+      /* ignore */
+    }
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it("returns true on an open row and false once the row is already terminal", async () => {
+    const t = new Date().toISOString();
+    await store.recordStart({
+      id: "guard-job",
+      correlationId: "guard-corr",
+      requestKey: "guard-key",
+      cli: "claude",
+      args: ["-p", "hi"],
+      startedAt: t,
+      pid: 4242,
+    });
+
+    const terminal = {
+      id: "guard-job",
+      status: "canceled" as const,
+      exitCode: null,
+      stdout: "PARTIAL",
+      stderr: "",
+      outputTruncated: false,
+      error: "canceled by caller",
+      finishedAt: t,
+    };
+
+    // First write lands: the row was still open.
+    expect(await store.recordComplete(terminal)).toBe(true);
+    // Second write is rejected by the #139 guard, which is exactly why late
+    // output cannot ride along on a replayed recordComplete.
+    expect(await store.recordComplete({ ...terminal, stdout: "PARTIAL+LATE" })).toBe(false);
+    expect((await store.getById("guard-job"))?.stdout).toBe("PARTIAL");
+
+    // ...but the fenced output write still lands on the terminal state the
+    // winning writer committed, without disturbing it. That is the path
+    // persistComplete falls back to, and the fence is what stops the SAME write
+    // landing on a row some other writer terminalized.
+    expect(await store.recordOutput("guard-job", "PARTIAL+LATE", "", false, ["canceled"])).toBe(
+      true
+    );
+    expect(await store.recordOutput("guard-job", "NOT-OURS", "", false, ["running"])).toBe(false);
+    const row = await store.getById("guard-job");
+    expect(row?.stdout).toBe("PARTIAL+LATE");
+    expect(row?.status).toBe("canceled");
+    expect(row?.error).toBe("canceled by caller");
+  });
+});
+
+describe("late child output survives a terminal-status-before-close transition", () => {
+  let tempDir: string;
+  let store: JobStore;
+  let manager: AsyncJobManager;
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "ajm-late-output-"));
+    store = new SqliteJobStore(join(tempDir, "jobs.db"));
+    manager = new AsyncJobManager(undefined, undefined, store);
+  });
+
+  afterEach(async () => {
+    try {
+      await store.close();
+    } catch {
+      /* ignore */
+    }
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it("persists bytes the child emits between cancel and close", async () => {
+    const job = await manager.startJob("node" as LlmCli, FLUSH_ON_SIGTERM, "corr-cancel-flush");
+
+    // Wait until the child is up and the gateway has seen its first bytes.
+    await waitFor(
+      async () => ((await manager.getJobSnapshot(job.id))?.stdoutBytes ?? 0) >= 11,
+      25_000
+    );
+
+    expect((await manager.cancelJob(job.id)).canceled).toBe(true);
+
+    // `canceled` is set the instant the signal is requested; the child only
+    // closes once it has run its SIGTERM handler. Wait for the real death.
+    await waitFor(async () => (await manager.getJobSnapshot(job.id))?.exited === true, 25_000);
+    // Let the close handler's terminal persistence run.
+    await waitFor(async () => (await store.getById(job.id))?.status === "canceled", 25_000);
+
+    const inMemory = await manager.getJobResult(job.id);
+    expect(inMemory?.stdout).toContain("EARLY_BYTES");
+    // The gateway DOES receive the late flush: it is in the in-memory buffer.
+    expect(inMemory?.stdout).toContain("LATE_FLUSH_MARKER");
+
+    // ...and it must also reach the durable store, which is the only copy that
+    // survives a gateway restart or is visible to another instance.
+    const row = await store.getById(job.id);
+    expect(row?.status).toBe("canceled");
+    expect(row?.stdout).toContain("EARLY_BYTES");
+    expect(row?.stdout).toContain("LATE_FLUSH_MARKER");
+  }, 60_000);
+
+  it("does not freeze capture accounting when a result is read before close", async () => {
+    const job = await manager.startJob(
+      "node" as LlmCli,
+      DELAYED_FLUSH_ON_SIGTERM,
+      "corr-cancel-capture-read"
+    );
+    await waitFor(
+      async () => ((await manager.getJobSnapshot(job.id))?.stdoutBytes ?? 0) >= 11,
+      25_000
+    );
+
+    expect((await manager.cancelJob(job.id)).canceled).toBe(true);
+    await manager.getJobResult(job.id);
+    expect((await store.getById(job.id))?.captureStatus).toBeNull();
+
+    await waitFor(async () => (await manager.getJobSnapshot(job.id))?.exited === true, 25_000);
+    await waitFor(async () => (await store.getById(job.id))?.captureStatus !== null, 25_000);
+    expect((await store.getById(job.id))?.stdout).toContain("LATE_FLUSH_MARKER");
+  }, 60_000);
+
+  it("refreshes the flight-recorder response with bytes flushed after cancel", async () => {
+    const rec = new FlightRecorder(join(tempDir, "logs.db"));
+    const frManager = new AsyncJobManager(undefined, undefined, store, rec);
+    try {
+      const outcome = await frManager.startJobWithDedup(
+        "node" as LlmCli,
+        FLUSH_ON_SIGTERM,
+        "corr-fr-flush",
+        {
+          writeFlightStart: true,
+          flightRecorderEntry: {
+            model: "test-model",
+            prompt: "assembled prompt",
+            sessionId: "sess-fr",
+            stablePrefixHash: "deadbeef",
+            stablePrefixTokens: 1,
+          },
+          forceRefresh: true,
+        }
+      );
+      const jobId = outcome.snapshot.id;
+
+      await waitFor(
+        async () => ((await frManager.getJobSnapshot(jobId))?.stdoutBytes ?? 0) >= 11,
+        25_000
+      );
+      expect((await frManager.cancelJob(jobId)).canceled).toBe(true);
+      await waitFor(async () => (await frManager.getJobSnapshot(jobId))?.exited === true, 25_000);
+
+      // llm_request_result reads this row; it is the documented way to read a
+      // full response back, so it must not stop at the pre-cancel snapshot.
+      await waitFor(
+        async () =>
+          ((await readPersistedRequest(rec, "corr-fr-flush"))?.response ?? "").includes("LATE"),
+        25_000
+      );
+      const persisted = await readPersistedRequest(rec, "corr-fr-flush");
+      expect(persisted?.response).toContain("EARLY_BYTES");
+      expect(persisted?.response).toContain("LATE_FLUSH_MARKER");
+    } finally {
+      await rec.close();
+    }
+  }, 60_000);
+
+  it("keeps the flight-recorder row refreshable after the dead-process sweep fires", async () => {
+    // The dead-process sweep marks a job failed the moment `kill(pid, 0)`
+    // reports ESRCH. A vanished pid is NOT a drained pipe: node still delivers
+    // buffered stdout before it emits `close`. If the flight row were finalized
+    // on that speculative signal, those bytes would never reach the persisted
+    // response, even though the job store still picks them up at close.
+    const rec = new FlightRecorder(join(tempDir, "logs.db"));
+    const frManager = new AsyncJobManager(undefined, undefined, store, rec);
+    try {
+      const outcome = await frManager.startJobWithDedup(
+        "node" as LlmCli,
+        FLUSH_ON_SIGTERM,
+        "corr-esrch",
+        {
+          writeFlightStart: true,
+          flightRecorderEntry: {
+            model: "test-model",
+            prompt: "assembled prompt",
+            sessionId: "sess-esrch",
+            stablePrefixHash: "deadbeef",
+            stablePrefixTokens: 1,
+          },
+          forceRefresh: true,
+        }
+      );
+      const jobId = outcome.snapshot.id;
+      await waitFor(
+        async () => ((await frManager.getJobSnapshot(jobId))?.stdoutBytes ?? 0) >= 11,
+        25_000
+      );
+
+      const internals = frManager as unknown as {
+        jobs: Map<string, { process: { pid: number } | null }>;
+        evictCompletedJobs: () => Promise<void>;
+      };
+      const record = internals.jobs.get(jobId)!;
+      const realPid = record.process!.pid;
+      // Point the manager's handle at a pid that cannot exist, so the sweep
+      // takes the ESRCH branch while the real child keeps running and its
+      // close handler stays wired up.
+      record.process = { pid: 0x7ffffff0 };
+      await internals.evictCompletedJobs();
+
+      // A speculative dead-process signal does not finalize the flight row
+      // from a pipe that has not closed yet.
+      expect((await readPersistedRequest(rec, "corr-esrch"))?.response).toBeNull();
+
+      // Now let the real child flush and close.
+      process.kill(realPid, "SIGTERM");
+      await waitFor(
+        async () =>
+          ((await readPersistedRequest(rec, "corr-esrch"))?.response ?? "").includes("LATE"),
+        25_000
+      );
+      expect((await readPersistedRequest(rec, "corr-esrch"))?.response).toContain(
+        "LATE_FLUSH_MARKER"
+      );
+    } finally {
+      await rec.close();
+    }
+  }, 60_000);
+
+  it("persists bytes the child emits after the output cap trips and before close", async () => {
+    // The overflow branch rejects ONLY the chunk that would cross the cap, so a
+    // later smaller chunk still fits and IS appended. Those bytes need the same
+    // rescue as the cancel path. (An earlier draft of the diagnosis claimed
+    // overflow could never accumulate late bytes; this test is why that was
+    // wrong.)
+    const capped = new AsyncJobManager(undefined, undefined, store, undefined, {
+      maxRunningJobs: 1000,
+      maxRunningJobsPerProvider: 1000,
+      maxQueuedJobs: 1000,
+      queueTimeoutMs: 600_000,
+      completedJobMemoryTtlMs: 3_600_000,
+      maxJobOutputBytes: 10,
+    });
+
+    // 11 bytes crosses the 10-byte cap and is dropped; the 1-byte SIGTERM
+    // flush that follows still fits under it.
+    const job = await capped.startJob(
+      "node" as LlmCli,
+      flushOnSigtermArgs("AAAAAAAAAAA", "X"),
+      "corr-overflow-flush"
+    );
+    await waitFor(async () => (await capped.getJobSnapshot(job.id))?.exited === true, 15_000);
+    await waitFor(async () => (await store.getById(job.id))?.status === "failed", 25_000);
+
+    const row = await store.getById(job.id);
+    expect(row?.outputTruncated).toBe(true);
+    expect(row?.exitCode).toBe(126);
+    // The post-cap byte reached the durable store.
+    expect(row?.stdout).toBe("X");
+  }, 60_000);
+
+  it("never overwrites a row another writer terminalized, including at close", async () => {
+    // The dangerous sequence, which a single-persist test does NOT reach:
+    //   1. another writer (another gateway instance on a shared Postgres store)
+    //      commits this row's terminal state;
+    //   2. our cancel calls recordComplete and the guard REJECTS it;
+    //   3. the child then closes, and persistComplete runs a SECOND time.
+    // Step 3 is where an ownership-blind implementation writes our stdout over
+    // their result. Before the status fence, recordOutput carried no predicate
+    // at all, so nothing downstream would catch it.
+    const job = await manager.startJob("node" as LlmCli, FLUSH_ON_SIGTERM, "corr-foreign-row");
+    await waitFor(
+      async () => ((await manager.getJobSnapshot(job.id))?.stdoutBytes ?? 0) >= 11,
+      25_000
+    );
+
+    // Step 1: a genuinely foreign terminal row, written straight to the store.
+    const foreignFinishedAt = new Date().toISOString();
+    expect(
+      await store.recordComplete({
+        id: job.id,
+        status: "completed",
+        exitCode: 0,
+        stdout: "FOREIGN_INSTANCE_RESULT",
+        stderr: "",
+        outputTruncated: false,
+        error: null,
+        finishedAt: foreignFinishedAt,
+      })
+    ).toBe(true);
+
+    // Steps 2 and 3.
+    await manager.cancelJob(job.id);
+    await waitFor(async () => (await manager.getJobSnapshot(job.id))?.exited === true, 25_000);
+    await new Promise(r => setTimeout(r, 500));
+
+    const row = await store.getById(job.id);
+    expect(row?.stdout).toBe("FOREIGN_INSTANCE_RESULT");
+    expect(row?.status).toBe("completed");
+    expect(row?.exitCode).toBe(0);
+    // Our own bytes must not have leaked in through the unfenced write.
+    expect(row?.stdout).not.toContain("EARLY_BYTES");
+    expect(row?.stdout).not.toContain("LATE_FLUSH_MARKER");
+  }, 60_000);
+
+  it("never overwrites a foreign row through the routine throttled flush either", async () => {
+    // The ownership rule has to hold for EVERY route that calls recordOutput,
+    // not just the post-terminal one. The routine flush in
+    // maybeFlushOutput is throttled by OUTPUT_FLUSH_INTERVAL_MS (1000ms), so a
+    // chunk arriving after that window is its own way onto the row. This case
+    // deliberately waits past the throttle before the foreign write, which the
+    // post-terminal-only guard does not cover.
+    const job = await manager.startJob("node" as LlmCli, FLUSH_ON_SIGTERM, "corr-foreign-flush");
+    await waitFor(
+      async () => ((await manager.getJobSnapshot(job.id))?.stdoutBytes ?? 0) >= 11,
+      25_000
+    );
+    // Let the flush throttle lapse so the next chunk can flush immediately.
+    await new Promise(r => setTimeout(r, 1300));
+
+    expect(
+      await store.recordComplete({
+        id: job.id,
+        status: "completed",
+        exitCode: 0,
+        stdout: "FOREIGN_INSTANCE_RESULT",
+        stderr: "",
+        outputTruncated: false,
+        error: null,
+        finishedAt: new Date().toISOString(),
+      })
+    ).toBe(true);
+
+    await manager.cancelJob(job.id);
+    await waitFor(async () => (await manager.getJobSnapshot(job.id))?.exited === true, 25_000);
+    await new Promise(r => setTimeout(r, 800));
+
+    const row = await store.getById(job.id);
+    expect(row?.stdout).toBe("FOREIGN_INSTANCE_RESULT");
+    expect(row?.status).toBe("completed");
+  }, 60_000);
+
+  it("persists bytes the child emits between an idle-timeout kill and close", async () => {
+    // idleTimeoutMs fires because the child stays silent after its first bytes.
+    // Keep it under OUTPUT_FLUSH_INTERVAL_MS (1000ms) so the late flush lands
+    // while the throttled output write is still closed; otherwise a late
+    // recordOutput would mask the fenced terminal write and this would pass
+    // even without the fix.
+    const job = await manager.startJob(
+      "node" as LlmCli,
+      FLUSH_ON_SIGTERM,
+      "corr-idle-flush",
+      undefined,
+      400
+    );
+
+    await waitFor(async () => (await manager.getJobSnapshot(job.id))?.exited === true, 15_000);
+    await waitFor(async () => (await store.getById(job.id))?.status === "failed", 25_000);
+
+    const row = await store.getById(job.id);
+    expect(row?.exitCode).toBe(125);
+    expect(row?.stdout).toContain("EARLY_BYTES");
+    expect(row?.stdout).toContain("LATE_FLUSH_MARKER");
+  }, 60_000);
+});

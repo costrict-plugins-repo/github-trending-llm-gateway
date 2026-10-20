@@ -1,0 +1,335 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Repository Overview
+
+This repository contains the **llm-cli-gateway** (npm `llm-cli-gateway`, MCP name `io.github.verivus-oss/llm-cli-gateway`), a production-ready Model Context Protocol (MCP) server that provides unified access to multiple LLM CLI tools (Claude Code, Codex, Gemini, Grok, Mistral Vibe, Devin, and Cursor). The canonical provider list is `CLI_TYPES` in `src/provider-types.ts`. The gateway enables multi-LLM orchestration, session management, async job orchestration with durable results, cross-LLM validation, token optimization, and retry logic with circuit breakers. Requires Node `>=24.4.0` (uses the built-in `node:sqlite` module).
+
+The package is developed in this internal repo and released via a public GitHub mirror (`verivus-oss/llm-cli-gateway`) that publishes to npm. See the memory notes on the release flow before touching anything release related.
+
+## Development Commands
+
+### Build and Test
+
+The test runner is **vitest** (`npm test` == `vitest run`). The default suite spans `src/__tests__/**/*.test.ts` and `scripts/**/*.test.mjs`.
+
+```bash
+# Build TypeScript to JavaScript (tsconfig.build.json excludes tests)
+npm run build
+
+# Run all tests
+npm test
+
+# Run a single test file (any path)
+npx vitest run src/__tests__/executor.test.ts
+# ...or a single test by name
+npx vitest run -t "circuit breaker opens"
+
+# Named suite shortcuts
+npm run test:unit          # executor.test.ts
+npm run test:session       # session-manager.test.ts
+npm run test:integration   # real CLI calls (INTEGRATION_TESTS=1)
+npm run test:fuzz          # fast-check property/fuzz tests
+npm run test:pg            # Postgres-backed suites (spins up PG via scripts/test-pg.sh)
+npm run test:all           # npm test + test:pg
+npm run test:coverage      # v8 coverage (70% lines/functions/statements, 60% branches)
+
+# Watch mode for development
+npm run test:watch
+
+# The full gate. `node scripts/check.mjs --list` prints the steps; they are
+# declared in scripts/check-steps.mjs, not chained in package.json.
+#
+# EVERY step runs and every result is reported, which the previous 22-step
+# `&&` chain could not do: one failure hid every step after it, and that is not
+# hypothetical, `security:audit` sat at 21 of 22 failing on every developer tree
+# so `verify:no-internal-mcp:check` never ran at all. A step blocked by a failed
+# dependency is reported SKIPPED and fails the gate; not run is not the same as
+# fine. `--fail-fast` restores the old stop-at-first behaviour when you want it.
+npm run check
+npm run check -- --only lint --only format:check   # one or more steps
+npm run check -- --list                            # what the gate contains
+```
+
+**`npm run check` never probes an installed provider binary.** `upstream:contracts` inside it is the offline contract check. Version drift against the CLIs actually installed on the host is caught only by `npm run upstream:drift`, which `scripts/pre-release.sh` runs _before_ `npm run check`. So a green `npm run check` says nothing about provider drift, and upgrading any provider CLI (including `claude` itself) can turn the release gate red while `check` stays green. Re-probe and rebaseline via `npm run providers:rebaseline`.
+
+`npm run check` also runs two structural gates and the release audit:
+
+- `npm run provider:surfaces:check` - the DRY ratchet for the provider registry: fails on any hand-maintained provider-name array or literal `sessions://` / `models://` resource URI outside the sanctioned files (everything must derive from `src/provider-definitions.ts` / `CLI_TYPES`).
+- `npm run site:generate:check` + `npm run site:validate` - `scripts/generate-site-discovery.mjs` generates `site/agent.json`, `.well-known/api-catalog`, `.well-known/ai-catalog.json`, `.well-known/mcp/server-card.json`, `.well-known/mcp.json`, `tools.md`, and `tools.fixture.json` from the live MCP tool surface. Regenerate those artifacts with `npm run site:generate`. `llms.txt`, `DISCOVERY.md`, `sitemap.*`, `openapi.json`, `agents.md`, and `.well-known/agent.json` are maintained separately and validated for discovery consistency.
+- `scripts/release-security-audit.sh` (`npm run security:audit`), which enforces release invariants. For example, `node:sqlite` must not be referenced outside `src/sqlite-driver.ts`, and packed `dist/**/*.js` and `dist/**/*.d.ts` must contain no unapproved `fetch` token. Run it before any release.
+
+  **It has two modes, and the default is the developer one.** The prod-only `npm-shrinkwrap.json` is generated at pack time and never committed, so a clean checkout does not have it. The audit used to exit 1 on that, which made `npm run check` permanently red on every developer tree and, because the steps are `&&`-chained, meant `verify:no-internal-mcp:check` never ran at all. By default the audit now generates the shrinkwrap for the duration of the run and removes it again, so the steps that pack and install a tarball audit the same artifact a release ships; it prints that parity against a committed file is not checked in that mode, because there is no committed file. Set `LLM_GATEWAY_REQUIRE_SHRINKWRAP=1` to restore the strict behaviour where absence is a failure. `pre-release.sh` and every workflow that runs the audit or the gate set it, and `scripts/check-gate-reachability.test.mjs` fails if a caller is added that does not.
+
+### Linting and Formatting
+
+```bash
+# Run ESLint
+npm run lint
+
+# Auto-fix ESLint issues
+npm run lint:fix
+
+# Format code with Prettier
+npm run format
+
+# Check formatting without changes
+npm run format:check
+```
+
+### Running the Server
+
+```bash
+# Start the MCP server (stdio transport, default)
+npm start
+
+# With debug logging
+DEBUG=1 npm start
+
+# HTTP transport (OAuth-gated remote surface)
+npm run start:http        # node dist/index.js --transport=http
+
+# Environment doctor (provider/CLI health, JSON output)
+npm run doctor            # node dist/index.js doctor --json
+
+# Apply PostgreSQL migrations (requires DATABASE_URL; install optional pg peer if absent)
+DATABASE_URL='postgresql://<user>:<password>@<host>/<database>' npm run migrate
+```
+
+## Architecture
+
+### Core Modules
+
+The codebase follows strict single-responsibility principles:
+
+- **`src/index.ts`** - Main MCP server setup and tool orchestration (the largest file in the tree). Defines all tools (`claude_request` / `codex_request` / `gemini_request` / `grok_request` / `mistral_request` / `devin_request` / `cursor_request` and their `*_request_async` variants, validation tools, session/job/workspace tools). The heavy per-request logic is delegated to `src/request-helpers.ts`; `createGatewayServer` (re-exported via the tiny `src/gateway-server.ts`) wires everything together behind a `GatewayServerRuntime`. All logging must go to stderr (stdout is reserved for MCP protocol).
+
+- **`src/request-helpers.ts`** - Request **argument planning** only: building and validating CLI argv, session-resume argument shaping, and flag/enum vocabularies. It does not run the executor, normalize provider output, write flight-recorder rows, or enforce principal isolation, despite an earlier version of this file claiming all four. Those live in `src/async-job-manager.ts`, `src/executor.ts`, `src/flight-recorder.ts` and `src/index.ts` respectively. Provider request behaviour beyond argv is still mostly in `index.ts`.
+
+- **`src/executor.ts`** - CLI command execution with timeout support. Spawns child processes with extended PATH (includes ~/.local/bin, ~/.nvm paths). Enforces 50MB output limit to prevent DoS. Implements graceful termination with two different windows: `PROCESS_GROUP_KILL_GRACE_MS` is 5s per request, but gateway shutdown sends SIGTERM to all groups and waits only 3s before SIGKILLing survivors. Unscoped CLI children receive a fresh private cwd from `src/neutral-workspace.ts`; native `E2BIG` is normalized through `src/cli-input-limits.ts`.
+
+- **`src/session-manager.ts`** - Persistent session storage. Uses atomic file writes (temp file + fsync + rename) to prevent corruption. Sessions stored in `~/.llm-cli-gateway/sessions.json` with 0o600 permissions. Maintains active session per CLI type. `src/session-manager-pg.ts` is the Postgres-backed variant (over the `pg` pool in `src/db.ts`), exercised by the `*-pg` suites via `npm run test:pg`.
+
+- **`src/retry.ts`** - Exponential backoff retry logic with circuit breaker pattern. Per-CLI circuit breakers track failures (threshold: 5, reset: 60s). Distinguishes transient errors (timeout, ECONNRESET) from non-transient (ENOENT).
+
+- **`src/optimizer.ts`** - Token optimization for prompts (44% reduction) and responses (37% reduction). Opt-in via optimizePrompt/optimizeResponse parameters.
+
+- **`src/resources.ts`** - MCP resources provider. Eleven resource schemes are exposed, not three: `sessions://`, `models://`, `metrics://` (`performance`, `process-health`), `cache-state://`, `health://`, `provider-acp://`, `provider-subcommands://`, `provider-tools://`, `routing://` (`decisions`, `priors`), `validation-receipt://`, and `skills://`. Registration is spread across `src/resources.ts` and `src/index.ts`, so grep both before assuming a scheme does not exist. CLI/model info itself lives in `src/model-registry.ts`.
+
+- **`src/metrics.ts`** - Performance tracking for CLI requests (latency, token usage, success rates).
+
+- **`src/sqlite-driver.ts`** - Thin adapter over Node's built-in `node:sqlite` module (`DatabaseSync`). The ONLY production module that touches `node:sqlite`; flight-recorder and job-store talk to SQLite exclusively through its `GatewayDatabase`/`GatewayStatement` surface (`openDatabase`/`openReadOnly`/`withTransaction`). No native binding, no install scripts. As of 2.0.0, better-sqlite3 is a devDependency only (legacy-schema seeding tests + cross-engine WAL fixtures); the release security audit hard-fails if `node:sqlite` is referenced outside this adapter.
+
+- **`src/flight-recorder.ts` / `src/flight-recorder-pg.ts`** - Flight recorder implementations for SQLite and PostgreSQL. `flightRecorderEngineDecision` follows `[persistence].backend` directly: `postgres` uses PostgreSQL for request history and never falls back to SQLite after a PostgreSQL failure. The DSN boundary validates only that the value is a PostgreSQL URL; topology admission and DSN-derived target rendering do not exist. PostgreSQL failures are generic on health surfaces. Switching engines does not migrate, dual-write, or cross-read existing rows. **Read history through the tools, not the database**: `llm_request_list` enumerates recent requests, `llm_request_result` returns a request by `correlationId`, and `llm_job_result` returns async output by `jobId`. Direct database reads bypass the per-principal ownership checks those tools enforce.
+
+- **`src/job-store.ts`** - Async-job persistence layer. Defines the `JobStore` interface plus three implementations: `SqliteJobStore` (default, durable), `MemoryJobStore` (ephemeral, used by tests), and `PostgresJobStore` (shipped: its SQL lives in `src/postgres-job-store-ops.ts` and runs over the `PostgresStorageDriver` storage port. The worker thread is gone: it existed only because `JobStore` was synchronous, and s5 made it asynchronous. Needs the optional `pg` peer dependency, plus `src/db.ts` / `scripts/test-pg.sh` for tests). A shared Postgres store can serve multiple gateway instances, so orphan recovery and normalized progress writes are status-fenced and instance-scoped rather than using a blanket startup sweep. Construct via `createJobStore(persistenceConfig)`. **Structural invariant**: when `persistence.backend = "none"`, `createJobStore` returns `null` AND `createGatewayServer` does not register the `*_request_async` / `llm_job_*` tools, making silent in-memory loss impossible by construction.
+
+- **`src/config.ts`** - Gateway configuration loader. `loadPersistenceConfig()` reads `~/.llm-cli-gateway/config.toml` (override with `LLM_GATEWAY_CONFIG`), validated via Zod. The legacy env vars `LLM_GATEWAY_LOGS_DB` / `LLM_GATEWAY_JOBS_DB` / `LLM_GATEWAY_JOB_RETENTION_DAYS` / `LLM_GATEWAY_DEDUP_WINDOW_MS` still work as deprecated overrides and emit one-time warnings. The resolved `PersistenceConfig` is threaded through `GatewayServerRuntime` so tool registration can gate on `persistence.asyncJobsEnabled`.
+
+- **`src/review-integrity.ts`** - Detects when orchestrating agents bypass multi-LLM review via tool suppression, empty allowedTools, or critical tool disabling. Three violation types with scoring.
+
+- **`src/async-job-manager.ts`** - Orchestrates the `*_request_async` lifecycle: enqueue, run, poll/watch (`llm_job_status` / `llm_job_watch` / `llm_job_result` / `llm_job_cancel`), dedup window, retention. `src/job-progress.ts` produces bounded privacy-safe structured/activity progress and a versioned durable projection. Persists through the `JobStore` (see `job-store.ts`). Sync requests that exceed ~45s auto-defer into this same machinery.
+
+- **`src/personal-config.ts`** / **`src/personal-config-types.ts`** - Personal Agent Config Kit for a single developer's verified Git baseline and repository overlay across local workstations. Kit execution is local-only, requires durable SQLite or PostgreSQL job admission, supports Claude, Codex, and Mistral only (declared once as `personalConfigKit.supported` in `src/provider-definitions.ts`, which both admission gates and every read-only surface derive from), binds context and native continuity to the current process, and fails closed when provenance or recovery evidence is incomplete. `src/codex-kit-isolation.ts`, `src/mistral-kit-isolation.ts`, `src/mcp-artifact-admission.ts`, and `src/mcp-artifact-recovery.ts` enforce its provider-isolation and durable-artifact boundaries.
+
+- **`src/provider-definitions.ts`** - The provider registry: single source of truth for provider identity, capability, session-continuity, and discovery facts for every member of `CLI_TYPES` (`src/provider-types.ts` is the one sanctioned place the provider names are spelled out). No other module may keep its own provider list, capability matrix, or literal `sessions://` / `models://` URI; import the registry (or a projection via `src/provider-surface-generator.ts`) instead. Enforced by `npm run provider:surfaces:check` and a compile-time `satisfies Record<CliType, ProviderDefinition>`. Import direction is one-way: it imports only from `provider-types.ts`; everything else imports from it.
+
+- **`src/model-registry.ts`** / **`src/mcp-registry.ts`** - Single source of truth for CLI/model metadata (`getCliInfo` / `getAvailableCliInfo`) and for the internal MCP server names. `mcp-registry.ts` is deliberately stripped to a stub in the published tarball; the release audit guards against internal names leaking.
+
+- **Validation subsystem** (`src/validation-orchestrator.ts`, `validation-tools.ts`, `validation-prompts.ts`, `validation-normalizer.ts`, `validation-report.ts`, `validation-receipt.ts`) - Implements the cross-LLM validation tools (`review_changes`, `validate_with_models`, `second_opinion`, `compare_answers`, `red_team_review`, `consensus_check`, `synthesize_validation`). `src/review-scope.ts` captures complete hashed Git evidence and `src/review-prompt.ts` fences it as untrusted input. Validation runs are durable (`validation_runs`), gated on a SQLite or PostgreSQL validation-run store, and emit canonically hashed immutable receipts.
+
+- **API-provider surface** (`src/api-provider.ts`, `api-request.ts`, `api-http.ts`) - First-class HTTP/API providers (OpenRouter, OpenAI-compatible) that reach parity with the CLI-tool providers, using `node:https` rather than spawning a CLI. Routed through the same request/job/validation machinery.
+
+- **`src/http-transport.ts`** + **`src/oauth.ts`** / **`src/auth.ts`** + **`src/endpoint-exposure.ts`** - The optional remote HTTP transport (`--transport=http`) and its OAuth gating. Remote exposure is opt-in; principal isolation (per-caller session/workspace ownership) is enforced in `request-helpers.ts`.
+
+- **`src/workspace-registry.ts`** + **`src/worktree-manager.ts`** - Gateway-owned workspaces and git worktrees (`workspace_*` tools), letting providers operate in isolated checkouts with lifecycle managed by the gateway.
+
+- **`src/doctor.ts`** - The `doctor` CLI subcommand: probes provider CLIs, auth state, persistence config, and DB health; emits JSON validated against `setup/status.schema.json`. Since schema_version 1.1 it also reports a `storage` block: flight-recorder state (`disabled` / `unavailable` / `initialising` / `degraded` / `active`), file and WAL bytes, schema version, request row counts, retention state, and the tables another subsystem left in the recorder's file. A `null` there means NOT MEASURED, never zero, and a recorder that failed to open or is failing operations sets `ok: false`.
+
+- **Least-cost routing** (`src/least-cost-router.ts`, `lcr-priors.ts`, `lcr-router-env.ts`, `lcr-telemetry.ts`, `least-cost-types.ts`, `pricing.ts`, `token-estimator.ts`) - Cost-aware provider selection behind `[least_cost].enabled` (default false), surfaced as `routing://decisions` and `routing://priors` and as the `select` parameter on the validation tools. Two things to know before trusting it: it filters candidates on the hand-maintained `ProviderDefinition.outputFormats` / `effortLevels` arrays rather than on the upstream contract, and it consumes `cliBreakerState()` as a live health signal even though circuit breakers never run on the async path.
+
+**This module list is not exhaustive.** It covers roughly 40 of the ~99 modules in `src/`. Absent but real: `cache-stats.ts`, `spawn-env-isolation.ts`, `secret-redaction.ts`, `approval-manager.ts`, `skill-loader.ts`, `provider-capability-{discovery,cache,resolver}.ts`, `provider-admin-tools.ts`, `health.ts`, `process-monitor.ts`, `request-limits.ts`, `prep-pipeline.ts`. Grep before concluding a capability does not exist.
+
+- **`src/upstream-contracts.ts`** + **`src/provider-codegen.ts`** + **`src/provider-tool-capabilities.ts`** - Upstream-CLI drift detection. After upgrading any provider CLI, the read-only `--help` probes here detect subcommand/flag drift (`upstream_contracts`, `provider_subcommand_*` tools, `npm run upstream:contracts`).
+
+- **`src/acp/`** - Agent Client Protocol runtime (JSON-RPC over stdio): client, process manager, permission bridge, session map, event normalizer, and smoke harness. Phase B live synchronous routing is shipped for Grok, Mistral, Devin, and Cursor, but remains dormant by default and fails closed unless the global ACP gate plus the provider `enabled` and `runtime_enabled` gates are configured. Claude, Codex, and Antigravity expose no native ACP route at their tracked versions; async request tools remain CLI-only.
+
+### Multi-LLM Orchestration Patterns
+
+**Pattern 1: Single-Level (Supported)**
+Parent orchestrates multiple child LLMs directly:
+
+```
+Parent → codex_request (implementation)
+Parent → claude_request (review)
+Parent → gemini_request (bug finding)
+```
+
+**Pattern 2: Multi-Level (Not Supported)**
+Child LLMs cannot orchestrate grandchildren due to MCP server lifecycle limitations. Nested MCP connections will fail with error -32000.
+
+**Pattern 3: Manual Multi-Level (Recommended)**
+Parent coordinates all levels sequentially:
+
+```
+1. codex_request (implement)
+2. claude_request (review quality) + gemini_request (review bugs) in parallel
+3. codex_request (apply fixes)
+4. Verify with tests
+```
+
+### Session Management
+
+Sessions persist conversation context across requests:
+
+- Each CLI (claude/codex/gemini/grok/mistral/devin/cursor) can have one active session
+- Sessions include: id, cli type, created/lastUsed timestamps, optional description
+- Active session automatically used if no sessionId specified
+- Session state is minimal (no conversation content stored)
+
+### Error Handling Philosophy
+
+- **Low-level functions throw** - executor.ts throws detailed errors
+- **Top-level functions catch** - tool handlers catch and format via createErrorResponse()
+- **Context-aware messages** - Errors include actionable guidance (e.g., "Ensure claude CLI installed and in PATH")
+- **Exit code handling** - 124 = timeout, 0 = success, non-zero = CLI error
+
+## Coding Conventions (Critical)
+
+### Tool Design
+
+- **Tool names MUST use snake_case** (claude_request, not claudeRequest)
+- Use Zod for all input validation
+- Tool descriptions must be clear and actionable (20+ chars)
+- Return structured error responses via createErrorResponse()
+
+### Logging
+
+- **NEVER use console.log** - stdout is reserved for MCP protocol
+- Use logger.info(), logger.error(), logger.debug() (writes to stderr)
+- Include correlation IDs in all logs for request tracing
+- Structured logging: timestamps, CLI type, model, timing, session IDs
+
+### TypeScript
+
+- All exported functions MUST have explicit return type annotations
+- Strict mode enabled (tsconfig.json)
+- Use Zod schemas for runtime validation at API boundaries
+
+### Testing Requirements
+
+- Enforced coverage: 70% lines, functions, and statements; 60% branches
+- Follow AAA pattern (Arrange, Act, Assert)
+- Unit tests: complete mocks for isolation (fs, child_process)
+- Integration tests: real CLI calls with actual commands
+- Each test cleans up its own sessions
+
+### DRY Principle
+
+- No duplicate constants across files
+- Provider identity/capability facts live only in provider-definitions.ts; never write a literal provider-name array or `sessions://` / `models://` URI elsewhere (`npm run provider:surfaces:check` fails the build if you do)
+- CLI/model info defined once in model-registry.ts (`getCliInfo`/`getAvailableCliInfo`), imported elsewhere
+- Shared types exported from their defining module
+
+### Session State Design
+
+- Persist only essential data (id, cli, timestamps, description)
+- No conversation content in session storage
+- Use crypto.randomUUID() for secure session IDs
+- File permissions: 0o600 on sessions.json
+
+## Common Gotchas
+
+### MCP Protocol
+
+- stdout is reserved for MCP JSON-RPC protocol
+- All human-readable output must go to stderr
+- Tool results return content array: `[{ type: "text", text: "..." }]`
+
+### Retry Logic
+
+- Circuit breakers are per-CLI command
+- Transient errors (timeout, ECONNRESET) trigger retry
+- Non-transient errors (ENOENT) fail immediately
+- Retry respects circuit breaker state (CLOSED/OPEN/HALF_OPEN)
+
+### Path Resolution
+
+- CLI tools may be in ~/.local/bin, ~/.nvm/versions/node/*/bin
+- executor.ts extends PATH automatically
+- NVM paths are cached after first lookup
+
+### Session IDs Are Provider-Specific
+
+- Gateway mints `gw-*` session IDs for its own tracking, but **Codex** resume requires a real Codex UUID (from `~/.codex/sessions/`); a `gw-*` ID is rejected. All six other providers accept the gateway flow: Claude `--continue`, Gemini `--conversation` / `--continue`, Grok `--resume` / `--continue`, Mistral `--resume` / `--continue`, Devin `--resume` / `--continue`, Cursor `--resume` / `--continue`.
+- **Mistral has a second UUID trap.** `parseVibeMetaJson` reads token and cost usage from `~/.vibe/logs/session/<id>/meta.json`, and returns `{}` when the session id is absent or starts with `gw-`. Every fresh mistral request mints a `gw-*` id, so mistral usage is unreachable unless the caller resumes with a real Vibe UUID. This is why mistral shows 0 of 1686 rows with token data.
+- Principal isolation: a caller may only resume sessions / use workspaces it owns. Never thread a `sessionId`, `workingDir`, or `worktree` taken from another principal's metadata into a request handler.
+
+### Persistence and Async Jobs
+
+- Persistence is configured in `~/.llm-cli-gateway/config.toml` (override with `LLM_GATEWAY_CONFIG`); `persistence.backend` is `"sqlite"` (default), `"postgres"` (shared store, multi-instance capable), or `"none"`. When `persistence.backend = "none"`, the `*_request_async` / `llm_job_*` tools are **not registered** at all, so async work can never silently land in lost in-memory state.
+- Durable validation receipts and cross-LLM validation runs require a SQLite (or attached) job store, not merely `asyncJobsEnabled`.
+
+### Atomic File Writes
+
+- Always use pattern: write to temp → fsync → rename
+- Temp files include process.pid to avoid conflicts
+- Set file permissions (0o600) after atomic rename
+
+## Writing volume (enforced, not advisory)
+
+Every other writing rule here governs style. None governed VOLUME, and one
+recent program shipped 5,665 lines of which 1,799 were plan prose (2,499 counting
+all of `docs/`) against 1,095
+of `src`. These are numbers because "concise" is not enforceable and a number is.
+
+| artefact                | limit                                                                             | enforced by                               |
+| ----------------------- | --------------------------------------------------------------------------------- | ----------------------------------------- |
+| commit / PR body        | 20 non-blank lines                                                                | `~/.claude/hooks/limit-prose-volume.sh`   |
+| a new `src/**.ts`       | comment lines <= code lines (applies at 40+ code lines)                           | same hook                                 |
+| `docs/plans/*.dag.toml` | 150 lines for a new file, 40 lines per edit, and never above its recorded ceiling | same hook + `npm run plans:density:check` |
+
+**Where the detail goes instead.** A DAG node states the work and links its
+evidence; measurements, alternatives considered and reasoning history belong in
+`docs/evidence/<topic>-<date>.md` (gitignored, host-local, never mirrored), which `durable-state-lifecycle.dag.toml`
+already does. A code comment explains what is non-obvious about the CODE, not
+the policy behind it, which is in the plan file. A commit states the change and
+the evidence for it, not how the conclusion was reached.
+
+`npm run plans:density:update` re-records the ceilings; it fails on a deleted
+file too, so a removed ceiling cannot silently return.
+
+## Pre-Commit Checklist
+
+Before finalizing any changes:
+
+- [ ] All tool names use snake_case
+- [ ] Error messages are actionable and context-aware
+- [ ] No console.log (use logger.info/error/debug)
+- [ ] All exported functions have return type annotations
+- [ ] Tests added for new functionality
+- [ ] TypeScript compiles: `npm run build`
+- [ ] All tests pass: `npm test`
+- [ ] No duplicate code or constants
+- [ ] `docs/guides/BEST_PRACTICES.md` reviewed if introducing new patterns
+
+## Additional Documentation
+
+Refer to these files for deeper context:
+
+- `docs/guides/BEST_PRACTICES.md` - Comprehensive design patterns and architectural decisions
+- `.cursorrules` - Project-specific rules and conventions
+- `README.md` - User-facing documentation and API reference
+- `CHANGELOG.md` - Release history and breaking changes
+- `docs/guides/PERSONAL_AGENT_CONFIG_KIT.md` - Personal Agent Config Kit setup, scope, recovery, and privacy boundary
+- `.agents/skills/*/SKILL.md` - Agent-facing skills, exposed as `skills://` MCP resources. Two audiences, and only one of them ships. The **workflow** skills ship in the npm package (async-job-orchestration, multi-llm-review, session-workflow, secure-orchestration, implement-review-fix, retrospective-walk, public-demo-session, least-cost-routing, personal-agent-config-kit). The **`provider-*`** skills deliberately do NOT: they are maintainer documentation for this repository ("Track and maintain the upstream `<X>` CLI contract"), they instruct the reader to edit `src/upstream-contracts.ts`, and they cite internal identifiers that `scripts/release-security-audit.sh` rejects in a shipped artifact. `gateway-restart-surfaces` is additionally gitignored: host-local operational guidance, never committed. `src/__tests__/skill-packaging.test.ts` enforces both directions, so a shipped skill cannot be dropped and a maintainer skill cannot be packaged. It compares against `git ls-files`, not the filesystem, because `npm pack` and a directory listing both see untracked files a consumer never receives.
+- `docs/plans/` - Design drafts **and 33 `*.dag.toml` implication maps**. Two things to know before using them.
+
+  **Work is represented as a DAG before it is written, not narrated afterwards.** If you are about to change a mapped surface, find the node and follow `affects` transitively to the leaves; every node on that path is a place the change must be considered. If you are starting new multi-step work, write the DAG first.
+
+  **Most DAGs describe completed work and say so nowhere.** Only 3 of 33 have any node marked `done`, 17 carry no `status` field at all, and a dozen still show nodes as `planned` whose code shipped months ago. A `planned` node is not evidence that something is unimplemented; check the code. Files whose premise is fully superseded (for example `grok-0.2.33-contract-sync.dag.toml`, which targets a version 800 releases stale, and `xstate-store-integration.dag.toml`, whose dependency was never added) are dead and should not be treated as intent.
+
+  The two currently load-bearing maps:
+  - `validation-launch-surface.dag.toml` - the only machine-checked one (`npm run dag:launch-surface:check`, inside `npm run check`). It verifies caller counts by real TypeScript AST analysis. Note its checker validates that `affects` is a non-empty string list but never that those strings name declared nodes, so a dangling edge passes silently.
+  - `durable-state-lifecycle.dag.toml` - what is written, what is bounded, what leaks. Read it before adding any durable table or status value. Evidence in `docs/evidence/durable-state-2026-08-18.md` (internal, not mirrored).

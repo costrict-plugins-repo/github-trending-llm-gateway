@@ -1,0 +1,1238 @@
+import { Dirent, existsSync, readFileSync, readdirSync, statSync } from "fs";
+import { homedir } from "os";
+import path from "path";
+import { parse as parseToml } from "smol-toml";
+import { CLI_TYPES, type CliType } from "./provider-types.js";
+
+type ModelSource = "fallback" | "observed" | "config" | "live" | "env";
+type ModelConfidence = "low" | "medium" | "high";
+
+export interface ModelMetadata {
+  source: ModelSource;
+  sourceDetail: string;
+  confidence: ModelConfidence;
+  lastSeen?: string;
+}
+
+export interface CliInfo {
+  description: string;
+  models: Record<string, string>;
+  unverifiedModelHints?: Record<string, string>;
+  defaultModel?: string;
+  defaultModelSource?: string;
+  modelOrder?: string[];
+  aliases?: Record<string, string>;
+  modelMetadata?: Record<string, ModelMetadata>;
+  warnings?: string[];
+  /**
+   * Provider default agent/permission profile, when the provider selects a model
+   * surface via an agent rather than a model id (Mistral/Vibe `default_agent`).
+   */
+  defaultAgent?: string;
+}
+
+export type CliInfoMap = Record<CliType, CliInfo>;
+
+const FALLBACK_INFO: CliInfoMap = {
+  claude: {
+    description:
+      "Anthropic's Claude Code CLI - best for code generation, analysis, and agentic coding tasks",
+    models: {
+      opus: "Most capable model. Best for: complex reasoning, nuanced analysis, difficult problems, research",
+      sonnet:
+        "Balanced performance. Best for: everyday coding, code review, general tasks (default)",
+      haiku:
+        "Fastest model. Best for: simple queries, quick answers, high-volume tasks, cost-sensitive use",
+    },
+    defaultModel: "sonnet",
+    modelOrder: ["opus", "sonnet", "haiku"],
+  },
+  codex: {
+    // U26: gpt-5.5 is the bundled fallback default. Config/env overrides still
+    // win (applyCodexOverrides runs after). Older aliases are retained in the
+    // models map so callers that still pass `gpt-5.3-codex` resolve cleanly.
+    description: "OpenAI's Codex CLI - best for code execution in sandboxed environments",
+    models: {
+      "gpt-5.5": "Latest Codex frontier model. Best for: most Codex tasks (default since U26)",
+      "gpt-5.4": "Frontier coding and professional-work model. Best for: long-running agentic work",
+      "gpt-5.3-codex":
+        "Legacy specialized Codex model (kept for backwards-compat). Best for: agentic coding workflows with Codex-tuned behavior",
+      "gpt-5.2": "Strong general-purpose GPT-5 model. Best for: broad coding and reasoning tasks",
+      "gpt-5-pro":
+        "Highest-capability GPT-5 model. Best for: deep reasoning and difficult professional workflows",
+    },
+    defaultModel: "gpt-5.5",
+    modelOrder: ["gpt-5.5", "gpt-5.4", "gpt-5.3-codex", "gpt-5.2", "gpt-5-pro"],
+  },
+  gemini: {
+    description: "Google's Gemini CLI - best for multimodal tasks and Google ecosystem integration",
+    models: {
+      "gemini-2.5-pro": "Most capable model. Best for: complex reasoning, long context, multimodal",
+      "gemini-2.5-flash":
+        "Fast model. Best for: quick responses, high throughput, cost-sensitive use",
+    },
+  },
+  grok: {
+    // No hardcoded `defaultModel`. Let Grok CLI pick its own built-in default
+    // unless an explicit value is found via env vars in applyGrokOverrides.
+    // Model list tracks `grok models` as of Grok CLI 0.2.99: the legacy
+    // `grok-build` id was removed upstream and now hard-fails the request with
+    // `Invalid params: "unknown model id"`, so it must not be advertised here.
+    description: "xAI's Grok Build CLI - best for agentic coding tasks via xAI's Grok models",
+    models: {
+      "grok-4.5":
+        "Grok 4.5 frontier model and the Grok CLI's own default (500K context, supports reasoning effort). Best for: most Grok build sessions and general agentic coding",
+      "grok-composer-2.5-fast":
+        "Composer 2.5, a Cursor coding model exposed by the Grok CLI (200K context, no reasoning-effort support).",
+    },
+    modelOrder: ["grok-4.5", "grok-composer-2.5-fast"],
+  },
+  mistral: {
+    // Mistral Vibe selects the active model via VIBE_ACTIVE_MODEL; there is no
+    // `--model` flag. Do not set a bundled default here: Vibe's own default and
+    // user config move independently of this gateway. The model list is only a
+    // low-confidence recovery set for stale config/model-not-found failures.
+    description:
+      "Mistral AI's Vibe CLI - agentic coding via Mistral models (model selection via VIBE_ACTIVE_MODEL env var)",
+    models: {
+      "mistral-medium-3.5":
+        "Vibe coding model alias observed in Vibe 2.x defaults. Used only when discovery/config requires an explicit VIBE_ACTIVE_MODEL.",
+      "devstral-small":
+        "Vibe coding model alias observed in Vibe 2.x defaults. Used only when configured explicitly.",
+    },
+    modelOrder: ["mistral-medium-3.5", "devstral-small"],
+  },
+  devin: {
+    // Devin CLI is multi-model and selects its own default; do not hardcode a
+    // `defaultModel` here. The `--model` flag passes a model name through; these
+    // are doc-derived hints (build.devin.ai / cli.devin.ai), not a verified list.
+    description:
+      "Cognition's Devin CLI - agentic coding agent that runs in your terminal, multi-model, with handoff to cloud Devin",
+    models: {
+      opus: "Anthropic Opus frontier model exposed by Devin CLI (e.g. --model opus).",
+      "gpt-5.5": "OpenAI GPT frontier model exposed by Devin CLI.",
+      "swe-1.6": "Cognition's SWE-1.6 model (also reachable via the /fast slash command).",
+    },
+    modelOrder: ["opus", "gpt-5.5", "swe-1.6"],
+  },
+  cursor: {
+    // Cursor Agent exposes `--list-models` / `models` for account-specific
+    // discovery, and the CLI selects its own default when no `--model` is
+    // supplied. These fallback hints mirror examples from `cursor-agent --help`.
+    description: "Cursor Agent CLI - agentic coding and review in Cursor's headless terminal agent",
+    models: {
+      "gpt-5": "OpenAI GPT-5 model accepted by Cursor Agent examples.",
+      "sonnet-4-thinking": "Claude Sonnet thinking model accepted by Cursor Agent examples.",
+      "claude-opus-4-8":
+        "Parameterized Claude Opus model family accepted by Cursor Agent examples.",
+    },
+    modelOrder: ["gpt-5", "sonnet-4-thinking", "claude-opus-4-8"],
+  },
+};
+
+const MODEL_CACHE_TTL_MS = 2 * 60 * 1000;
+const MAX_GEMINI_HISTORY_FILES = 200;
+const MAX_GEMINI_HISTORY_FILE_BYTES = 2 * 1024 * 1024;
+const SOURCE_PRIORITY: Record<ModelSource, number> = {
+  fallback: 0,
+  observed: 1,
+  config: 2,
+  // A live CLI catalog (e.g. `grok models`) is the authoritative statement of
+  // what the installed CLI actually accepts, so it outranks a config file that
+  // drifts. An explicit operator env override still wins over everything.
+  live: 3,
+  env: 4,
+};
+
+let cachedInfo: { loadedAt: number; info: CliInfoMap } | null = null;
+
+/**
+ * A live, CLI-probed model catalog for one provider (e.g. parsed from
+ * `grok models`). This is the authoritative statement of what the installed CLI
+ * currently accepts, so it supersedes drifting config-file defaults. It is
+ * populated out-of-band by the capability resolver (which owns the async probe)
+ * via {@link setLiveModelCatalog}, and consumed synchronously here so the hot
+ * read path never spawns. `null`/absent means "no live data" and the registry
+ * falls back to its static hints plus the provider's own built-in default.
+ */
+export interface LiveModelCatalog {
+  /** The CLI's own current default model id, when it reports one. */
+  readonly defaultModel?: string;
+  /** The models the live CLI catalog actually lists. */
+  readonly models: ReadonlyArray<{ readonly id: string; readonly description?: string }>;
+  /** Epoch ms the catalog was probed (observability only; no TTL enforced here). */
+  readonly fetchedAt: number;
+}
+
+const liveModelCatalogs = new Map<CliType, LiveModelCatalog>();
+
+/**
+ * Publish (or clear, with `null`) a live CLI-probed model catalog for a provider.
+ * Called by the capability resolver after it discovers a genuine live catalog.
+ * Clears the built-registry cache so the next {@link getCliInfo} reflects it.
+ * One-way: the registry never imports the resolver, so there is no cycle.
+ */
+export function setLiveModelCatalog(cli: CliType, catalog: LiveModelCatalog | null): void {
+  if (catalog === null) {
+    if (!liveModelCatalogs.has(cli)) return;
+    liveModelCatalogs.delete(cli);
+  } else {
+    liveModelCatalogs.set(cli, catalog);
+  }
+  cachedInfo = null;
+}
+
+/** Test/diagnostic accessor for the currently-published live catalog. */
+export function getLiveModelCatalog(cli: CliType): LiveModelCatalog | null {
+  return liveModelCatalogs.get(cli) ?? null;
+}
+
+export function getCliInfo(forceRefresh = false): CliInfoMap {
+  if (!forceRefresh && cachedInfo && Date.now() - cachedInfo.loadedAt < MODEL_CACHE_TTL_MS) {
+    return cachedInfo.info;
+  }
+
+  const info = buildCliInfo();
+  cachedInfo = { loadedAt: Date.now(), info };
+  return info;
+}
+
+export function getAvailableCliInfo(forceRefresh = false): CliInfoMap {
+  const info = getCliInfo(forceRefresh);
+  return Object.fromEntries(
+    CLI_TYPES.map(cli => [cli, filterUnverifiedModelHints(info[cli])])
+  ) as CliInfoMap;
+}
+
+export function clearModelRegistryCache(): void {
+  cachedInfo = null;
+}
+
+export function resolveModelAlias(
+  cli: CliType,
+  model: string | undefined,
+  info: CliInfoMap
+): string | undefined {
+  if (!model) {
+    return undefined;
+  }
+
+  const trimmed = model.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  const normalized = trimmed.toLowerCase();
+  const cliInfo = info[cli];
+
+  if (normalized === "default" || normalized === "latest") {
+    // If no default is configured, return undefined so the CLI picks its own
+    // built-in default. Avoids passing the literal string "default"/"latest"
+    // as a model name to the CLI.
+    return cliInfo.defaultModel;
+  }
+
+  const alias = resolveConfiguredAlias(cliInfo, normalized);
+  if (alias !== undefined) {
+    return alias;
+  }
+
+  if (cli === "gemini") {
+    if (normalized === "flash" || normalized === "pro") {
+      const picked = pickLatestMatching(cliInfo, normalized);
+      return picked ?? trimmed;
+    }
+  }
+
+  return trimmed;
+}
+
+function buildCliInfo(): CliInfoMap {
+  const info = Object.fromEntries(
+    CLI_TYPES.map(cli => [cli, cloneInfo(FALLBACK_INFO[cli])])
+  ) as CliInfoMap;
+
+  applyClaudeOverrides(info.claude);
+  applyCodexOverrides(info.codex);
+  applyGeminiOverrides(info.gemini);
+  applyGrokOverrides(info.grok);
+  applyMistralOverrides(info.mistral);
+
+  return info;
+}
+
+function cloneInfo(source: CliInfo): CliInfo {
+  const cloned: CliInfo = {
+    description: source.description,
+    models: { ...source.models },
+    unverifiedModelHints: source.unverifiedModelHints
+      ? { ...source.unverifiedModelHints }
+      : undefined,
+    defaultModel: source.defaultModel,
+    defaultModelSource: source.defaultModelSource,
+    modelOrder: source.modelOrder ? [...source.modelOrder] : undefined,
+    aliases: source.aliases ? { ...source.aliases } : undefined,
+    modelMetadata: source.modelMetadata ? { ...source.modelMetadata } : {},
+    warnings: source.warnings ? [...source.warnings] : [],
+    defaultAgent: source.defaultAgent,
+  };
+
+  Object.keys(cloned.models).forEach(model => {
+    cloned.modelMetadata![model] = cloned.modelMetadata![model] ?? {
+      source: "fallback",
+      sourceDetail: "Bundled fallback registry",
+      confidence: "low",
+    };
+  });
+
+  return cloned;
+}
+
+function filterUnverifiedModelHints(source: CliInfo): CliInfo {
+  const filtered = cloneInfo(source);
+  const models: Record<string, string> = {};
+  const metadata: Record<string, ModelMetadata> = {};
+  const hints: Record<string, string> = {};
+
+  Object.entries(source.models).forEach(([model, description]) => {
+    const modelMetadata = source.modelMetadata?.[model];
+    if (modelMetadata?.source === "fallback") {
+      hints[model] = description;
+      return;
+    }
+    models[model] = description;
+    if (modelMetadata) {
+      metadata[model] = modelMetadata;
+    }
+  });
+
+  filtered.models = models;
+  filtered.modelMetadata = metadata;
+  filtered.unverifiedModelHints = Object.keys(hints).length > 0 ? hints : undefined;
+  filtered.modelOrder = source.modelOrder?.filter(model => model in models);
+
+  if (filtered.defaultModel && !(filtered.defaultModel in models)) {
+    filtered.defaultModel = undefined;
+    filtered.defaultModelSource = undefined;
+  }
+
+  if (filtered.aliases) {
+    filtered.aliases = Object.fromEntries(
+      Object.entries(filtered.aliases).filter(
+        ([, target]) => target === "default" || target in models
+      )
+    );
+    if (Object.keys(filtered.aliases).length === 0) {
+      filtered.aliases = undefined;
+    }
+  }
+
+  if (filtered.unverifiedModelHints) {
+    addWarning(
+      filtered,
+      "Bundled fallback model hints were omitted from models because they are not validated against the installed CLI. They are exposed as unverifiedModelHints only."
+    );
+  }
+
+  return filtered;
+}
+
+function addWarning(info: CliInfo, warning: string): void {
+  info.warnings = info.warnings ?? [];
+  if (!info.warnings.includes(warning)) {
+    info.warnings.push(warning);
+  }
+}
+
+function isValidModelName(model: string): boolean {
+  return model.length > 0 && !/[\s\p{Cc}]/u.test(model);
+}
+
+function addModel(
+  info: CliInfo,
+  model: string,
+  description: string,
+  metadata: ModelMetadata,
+  options: { preferDescription?: boolean } = {}
+): void {
+  const normalized = model.trim();
+  if (!isValidModelName(normalized)) {
+    addWarning(info, `Ignored invalid model name from ${metadata.sourceDetail}`);
+    return;
+  }
+
+  const existingMetadata = info.modelMetadata?.[normalized];
+  const existingPriority = existingMetadata ? SOURCE_PRIORITY[existingMetadata.source] : -1;
+  const incomingPriority = SOURCE_PRIORITY[metadata.source];
+
+  if (
+    !info.models[normalized] ||
+    options.preferDescription ||
+    incomingPriority > existingPriority
+  ) {
+    info.models[normalized] = description;
+  }
+
+  info.modelMetadata = info.modelMetadata ?? {};
+  if (!existingMetadata || incomingPriority >= existingPriority) {
+    info.modelMetadata[normalized] = metadata;
+  }
+}
+
+function setDefaultModel(
+  info: CliInfo,
+  model: string | undefined,
+  source: string,
+  sourceType: ModelSource
+): void {
+  const normalized = model?.trim();
+  if (!normalized) {
+    return;
+  }
+
+  if (!isValidModelName(normalized)) {
+    addWarning(info, `Ignored invalid default model from ${source}`);
+    return;
+  }
+
+  addModel(info, normalized, `Configured default from ${source}`, {
+    source: sourceType,
+    sourceDetail: source,
+    confidence: sourceType === "env" ? "high" : "medium",
+  });
+  info.defaultModel = normalized;
+  info.defaultModelSource = source;
+}
+
+function addAlias(info: CliInfo, alias: string, target: string, source: string): void {
+  const normalizedAlias = alias.trim().toLowerCase();
+  const normalizedTarget = target.trim();
+  if (!normalizedAlias || /\s/.test(normalizedAlias) || !normalizedTarget) {
+    addWarning(info, `Ignored invalid alias from ${source}`);
+    return;
+  }
+  if (normalizedTarget !== "default" && !isValidModelName(normalizedTarget)) {
+    addWarning(info, `Ignored invalid alias target from ${source}`);
+    return;
+  }
+  info.aliases = info.aliases ?? {};
+  info.aliases[normalizedAlias] = normalizedTarget;
+}
+
+function resolveConfiguredAlias(info: CliInfo, normalizedAlias: string): string | undefined {
+  const target = info.aliases?.[normalizedAlias];
+  if (!target) {
+    return undefined;
+  }
+  if (target === "default") {
+    return info.defaultModel;
+  }
+  return target;
+}
+
+function addEnvModels(info: CliInfo, envName: string): void {
+  const entries = parseEnvModelEntries(process.env[envName], envName);
+  entries.forEach(entry => {
+    addModel(
+      info,
+      entry.model,
+      entry.description ?? `Configured via ${envName}`,
+      {
+        source: "env",
+        sourceDetail: envName,
+        confidence: "high",
+      },
+      { preferDescription: Boolean(entry.description) }
+    );
+  });
+}
+
+function addEnvAliases(info: CliInfo, cli: CliType, envName: string): void {
+  parseEnvAliasEntries(process.env[envName], envName, cli).forEach(entry => {
+    addAlias(info, entry.alias, entry.target, envName);
+  });
+}
+
+function addGlobalEnvAliases(info: CliInfo, cli: CliType): void {
+  parseEnvAliasEntries(
+    process.env.LLM_GATEWAY_MODEL_ALIASES,
+    "LLM_GATEWAY_MODEL_ALIASES",
+    cli
+  ).forEach(entry => {
+    addAlias(info, entry.alias, entry.target, "LLM_GATEWAY_MODEL_ALIASES");
+  });
+}
+
+function applyClaudeOverrides(info: CliInfo): void {
+  const settingsPath =
+    process.env.CLAUDE_SETTINGS_PATH || path.join(homedir(), ".claude", "settings.json");
+  const settingsLocalPath =
+    process.env.CLAUDE_SETTINGS_LOCAL_PATH ||
+    path.join(homedir(), ".claude", "settings.local.json");
+  const envDefault = process.env.CLAUDE_DEFAULT_MODEL;
+  const localDefault = readJsonStringValue(settingsLocalPath, [["model"], ["model", "name"]], info);
+  const settingsDefault = readJsonStringValue(settingsPath, [["model"], ["model", "name"]], info);
+
+  if (settingsDefault) {
+    setDefaultModel(info, settingsDefault, settingsPath, "config");
+  }
+  if (localDefault) {
+    setDefaultModel(info, localDefault, settingsLocalPath, "config");
+  }
+  if (envDefault) {
+    setDefaultModel(info, envDefault, "CLAUDE_DEFAULT_MODEL", "env");
+  }
+
+  addEnvModels(info, "CLAUDE_MODELS");
+  addEnvAliases(info, "claude", "CLAUDE_MODEL_ALIASES");
+  addGlobalEnvAliases(info, "claude");
+
+  info.modelOrder = buildOrder(info, info.defaultModel);
+}
+
+function applyCodexOverrides(info: CliInfo): void {
+  const configPath = process.env.CODEX_CONFIG_PATH || path.join(homedir(), ".codex", "config.toml");
+  const envDefault = process.env.CODEX_DEFAULT_MODEL;
+
+  if (existsSync(configPath)) {
+    try {
+      const content = readFileSync(configPath, "utf-8");
+      const parsed = parseToml(content);
+      const model = readStringProperty(parsed, "model");
+      setDefaultModel(info, model, configPath, "config");
+
+      const profiles = readRecordProperty(parsed, "profiles");
+      Object.entries(profiles).forEach(([profileName, profile]) => {
+        const profileModel = readStringProperty(profile, "model");
+        if (profileModel) {
+          addModel(info, profileModel, `Configured in Codex profile '${profileName}'`, {
+            source: "config",
+            sourceDetail: `${configPath} profile ${profileName}`,
+            confidence: "medium",
+          });
+        }
+      });
+
+      const notice = readRecordProperty(parsed, "notice");
+      const migrations = readRecordProperty(notice, "model_migrations");
+      Object.entries(migrations).forEach(([from, to]) => {
+        if (typeof to !== "string") {
+          return;
+        }
+        addModel(info, to, `Migration target for ${from}`, {
+          source: "config",
+          sourceDetail: `${configPath} notice.model_migrations`,
+          confidence: "medium",
+        });
+        addModel(info, from, `Legacy model (migrates to ${to})`, {
+          source: "config",
+          sourceDetail: `${configPath} notice.model_migrations`,
+          confidence: "medium",
+        });
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      addWarning(info, `Could not parse Codex config ${configPath}: ${message}`);
+    }
+  }
+
+  addEnvModels(info, "CODEX_MODELS");
+  addEnvAliases(info, "codex", "CODEX_MODEL_ALIASES");
+  addGlobalEnvAliases(info, "codex");
+
+  if (envDefault) {
+    setDefaultModel(info, envDefault, "CODEX_DEFAULT_MODEL", "env");
+  }
+
+  info.modelOrder = buildOrder(info, info.defaultModel);
+}
+
+function applyGeminiOverrides(info: CliInfo): void {
+  const settingsPath =
+    process.env.GEMINI_SETTINGS_PATH || path.join(homedir(), ".gemini", "settings.json");
+  const settingsDefault = readJsonStringValue(
+    settingsPath,
+    [["model"], ["model", "name"], ["selectedModel"], ["defaultModel"]],
+    info
+  );
+  const envDefault = process.env.GEMINI_DEFAULT_MODEL;
+
+  if (settingsDefault) {
+    setDefaultModel(info, settingsDefault, settingsPath, "config");
+  }
+
+  if (!isModelDiscoveryDisabled()) {
+    const observed = collectGeminiModels();
+    observed.forEach(observation => {
+      addModel(
+        info,
+        observation.model,
+        `Observed in local Gemini sessions (last seen ${observation.lastSeen})`,
+        {
+          source: "observed",
+          sourceDetail: observation.filePath,
+          confidence: "low",
+          lastSeen: observation.lastSeen,
+        }
+      );
+    });
+  }
+
+  addEnvModels(info, "GEMINI_MODELS");
+  addEnvAliases(info, "gemini", "GEMINI_MODEL_ALIASES");
+  addGlobalEnvAliases(info, "gemini");
+
+  if (envDefault) {
+    setDefaultModel(info, envDefault, "GEMINI_DEFAULT_MODEL", "env");
+  }
+
+  info.modelOrder = buildOrder(info, info.defaultModel);
+}
+
+/**
+ * Merge a provider's live CLI-probed catalog (see {@link setLiveModelCatalog})
+ * into the built info as the authoritative `live` source. Live models are
+ * surfaced as verified (non-fallback), and the live default supersedes a
+ * config-file default. A later explicit env default still wins (higher priority
+ * and applied afterwards). No-op when no live catalog is published, so the read
+ * path degrades to the static hints plus the CLI's own built-in default.
+ */
+function applyLiveCatalog(info: CliInfo, cli: CliType): void {
+  const catalog = liveModelCatalogs.get(cli);
+  if (!catalog) {
+    return;
+  }
+  const detail = `${cli} models (live CLI catalog)`;
+  catalog.models.forEach(model => {
+    addModel(info, model.id, model.description ?? `Live model reported by \`${cli} models\``, {
+      source: "live",
+      sourceDetail: detail,
+      confidence: "high",
+    });
+  });
+  if (catalog.defaultModel) {
+    setDefaultModel(info, catalog.defaultModel, detail, "live");
+  }
+}
+
+function applyGrokOverrides(info: CliInfo): void {
+  const envDefault = process.env.GROK_DEFAULT_MODEL;
+
+  // ~/.grok/config.toml carries custom model facts, but its [models].default is
+  // DELIBERATELY not adopted as the gateway default (see applyGrokConfig): Grok
+  // reads that file natively and rotates its own model lineup, so pinning a
+  // snapshot of it goes stale (e.g. the removed `grok-build`). The authoritative
+  // default/list is the live `grok models` catalog; absent that, we emit no
+  // --model and Grok picks its own current built-in default.
+  applyGrokConfig(info);
+  applyLiveCatalog(info, "grok");
+
+  addEnvModels(info, "GROK_MODELS");
+  addEnvAliases(info, "grok", "GROK_MODEL_ALIASES");
+  addGlobalEnvAliases(info, "grok");
+
+  // An explicit operator env default outranks even the live catalog.
+  if (envDefault) {
+    setDefaultModel(info, envDefault, "GROK_DEFAULT_MODEL", "env");
+  }
+
+  info.modelOrder = buildOrder(info, info.defaultModel);
+}
+
+function applyGrokConfig(info: CliInfo): void {
+  const configPath = process.env.GROK_CONFIG_PATH || path.join(homedir(), ".grok", "config.toml");
+  if (!existsSync(configPath)) {
+    return;
+  }
+
+  try {
+    const parsed = parseToml(readFileSync(configPath, "utf-8"));
+
+    // The Grok config nests model facts under [models]. We DELIBERATELY ignore
+    // the Grok-CLI-MANAGED / rotating values here so a drifting snapshot can
+    // never point callers at a removed model:
+    //   - [models].default   - Grok reads it natively and rotates its lineup
+    //                          (e.g. it dropped `grok-build`); the live
+    //                          `grok models` catalog is the source of truth, and
+    //                          a user default is still honoured by Grok itself
+    //                          when we emit no --model.
+    //   - [ui].fork_secondary_model - a UI/fork setting the CLI auto-writes, not
+    //                          a model the user declared for invocation.
+    // Only USER-DECLARED custom model ids (`[models].<name>`, name != default)
+    // remain, as intentional additive facts.
+    const models = readRecordProperty(parsed, "models");
+    Object.entries(models).forEach(([key, value]) => {
+      if (typeof value !== "string" || key === "default") {
+        return;
+      }
+      addModel(info, value, `Custom Grok model from config.toml [models].${key}`, {
+        source: "config",
+        sourceDetail: `${configPath} [models].${key}`,
+        confidence: "medium",
+      });
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    addWarning(info, `Could not parse Grok config ${configPath}: ${message}`);
+  }
+}
+
+function applyMistralOverrides(info: CliInfo): void {
+  const vibeConfig = readVibeConfig(info);
+
+  // Vibe selects a permission/agent profile via `default_agent`. Surface it as a
+  // model fact so the discovered listing / registry exposes it in production.
+  if (vibeConfig.defaultAgent) {
+    info.defaultAgent = vibeConfig.defaultAgent;
+  }
+
+  addVibeModelEntries(info, parseVibeModels(process.env.VIBE_MODELS, "VIBE_MODELS"), "env");
+  addVibeModelEntries(info, vibeConfig.models, "config");
+
+  addEnvModels(info, "MISTRAL_MODELS");
+  addEnvAliases(info, "mistral", "MISTRAL_MODEL_ALIASES");
+  addGlobalEnvAliases(info, "mistral");
+
+  // Vibe uses VIBE_ACTIVE_MODEL instead of a CLI flag. Explicit env values win.
+  const envDefault = process.env.MISTRAL_DEFAULT_MODEL || process.env.VIBE_ACTIVE_MODEL;
+  if (envDefault) {
+    const source = process.env.MISTRAL_DEFAULT_MODEL
+      ? "MISTRAL_DEFAULT_MODEL"
+      : "VIBE_ACTIVE_MODEL";
+    setDefaultModel(info, envDefault, source, "env");
+  } else if (vibeConfig.activeModel) {
+    const configuredActiveModel = vibeConfig.activeModel;
+    if (info.models[configuredActiveModel]) {
+      setDefaultModel(info, configuredActiveModel, vibeConfig.source, "config");
+    } else {
+      const migrated = migrateDeprecatedMistralModel(configuredActiveModel, info);
+      if (migrated) {
+        addWarning(
+          info,
+          `Vibe active_model '${configuredActiveModel}' is not in the discovered model list; using '${migrated}' as the gateway recovery model`
+        );
+        setDefaultModel(info, migrated, `${vibeConfig.source} recovery`, "config");
+      } else {
+        addWarning(
+          info,
+          `Vibe active_model '${configuredActiveModel}' is not in the discovered model list`
+        );
+      }
+    }
+  }
+
+  info.modelOrder = buildOrder(info, info.defaultModel);
+}
+
+interface VibeModelEntry {
+  alias: string;
+  name?: string;
+  description?: string;
+  sourceDetail: string;
+}
+
+interface VibeConfigDiscovery {
+  activeModel?: string;
+  /** Vibe `default_agent` config fact (agent/permission profile selection). */
+  defaultAgent?: string;
+  models: VibeModelEntry[];
+  source: string;
+}
+
+function readVibeConfig(info: CliInfo): VibeConfigDiscovery {
+  const vibeHome = process.env.VIBE_HOME || path.join(homedir(), ".vibe");
+  const configPath = path.join(vibeHome, "config.toml");
+  const result: VibeConfigDiscovery = { models: [], source: configPath };
+
+  if (!existsSync(configPath)) {
+    return result;
+  }
+
+  try {
+    const parsed = parseToml(readFileSync(configPath, "utf-8"));
+    const activeModel = readStringProperty(parsed, "active_model");
+    if (activeModel) {
+      result.activeModel = activeModel.trim();
+    }
+    const defaultAgent = readStringProperty(parsed, "default_agent");
+    if (defaultAgent) {
+      result.defaultAgent = defaultAgent.trim();
+    }
+    result.models = parseVibeModelArray(readRecordOrArrayProperty(parsed, "models"), configPath);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    addWarning(info, `Could not parse Vibe config ${configPath}: ${message}`);
+  }
+
+  return result;
+}
+
+function parseVibeModels(value: string | undefined, sourceDetail: string): VibeModelEntry[] {
+  if (!value || !value.trim()) {
+    return [];
+  }
+
+  try {
+    return parseVibeModelArray(JSON.parse(value), sourceDetail);
+  } catch {
+    return [];
+  }
+}
+
+function parseVibeModelArray(value: unknown, sourceDetail: string): VibeModelEntry[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((entry): VibeModelEntry | null => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        return null;
+      }
+      const record = entry as Record<string, unknown>;
+      const alias = typeof record.alias === "string" ? record.alias.trim() : "";
+      const name = typeof record.name === "string" ? record.name.trim() : undefined;
+      if (!alias) {
+        return null;
+      }
+      return {
+        alias,
+        name,
+        description: name ? `${alias} (${name}) from Vibe config` : `${alias} from Vibe config`,
+        sourceDetail,
+      };
+    })
+    .filter((entry): entry is VibeModelEntry => entry !== null);
+}
+
+function addVibeModelEntries(
+  info: CliInfo,
+  entries: VibeModelEntry[],
+  source: "config" | "env"
+): void {
+  entries.forEach(entry => {
+    addModel(
+      info,
+      entry.alias,
+      entry.description ?? `${entry.alias} from Vibe model configuration`,
+      {
+        source,
+        sourceDetail: entry.sourceDetail,
+        confidence: source === "env" ? "high" : "medium",
+      },
+      { preferDescription: true }
+    );
+
+    if (entry.name && entry.name !== entry.alias && isValidModelName(entry.name)) {
+      addAlias(info, entry.name, entry.alias, entry.sourceDetail);
+    }
+  });
+}
+
+function migrateDeprecatedMistralModel(model: string, info: CliInfo): string | undefined {
+  const normalized = model.trim().toLowerCase();
+  const replacement = ["devstral-medium", "devstral-large"].includes(normalized)
+    ? "mistral-medium-3.5"
+    : undefined;
+  if (replacement && info.models[replacement]) {
+    return replacement;
+  }
+  return undefined;
+}
+
+function readJsonStringValue(
+  filePath: string,
+  paths: string[][],
+  info?: CliInfo
+): string | undefined {
+  if (!existsSync(filePath)) {
+    return undefined;
+  }
+
+  try {
+    const content = readFileSync(filePath, "utf-8");
+    const parsed = JSON.parse(content);
+    for (const pathParts of paths) {
+      const value = readPath(parsed, pathParts);
+      if (typeof value === "string" && value.trim()) {
+        return value;
+      }
+    }
+    return undefined;
+  } catch (error) {
+    if (info) {
+      const message = error instanceof Error ? error.message : String(error);
+      addWarning(info, `Could not parse JSON config ${filePath}: ${message}`);
+    }
+    return undefined;
+  }
+}
+
+function readPath(value: unknown, pathParts: string[]): unknown {
+  let current = value;
+  for (const part of pathParts) {
+    if (!current || typeof current !== "object" || Array.isArray(current)) {
+      return undefined;
+    }
+    current = (current as Record<string, unknown>)[part];
+  }
+  return current;
+}
+
+function readStringProperty(value: unknown, key: string): string | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const prop = (value as Record<string, unknown>)[key];
+  return typeof prop === "string" && prop.trim() ? prop : undefined;
+}
+
+function readRecordProperty(value: unknown, key: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+  const prop = (value as Record<string, unknown>)[key];
+  return prop && typeof prop === "object" && !Array.isArray(prop)
+    ? (prop as Record<string, unknown>)
+    : {};
+}
+
+function readRecordOrArrayProperty(value: unknown, key: string): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  return (value as Record<string, unknown>)[key];
+}
+
+interface EnvModelEntry {
+  model: string;
+  description?: string;
+}
+
+function parseEnvModelEntries(value: string | undefined, source: string): EnvModelEntry[] {
+  if (!value) {
+    return [];
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return [];
+  }
+
+  if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) {
+        return parsed.flatMap(entry => {
+          if (typeof entry === "string") {
+            return [{ model: entry }];
+          }
+          if (entry && typeof entry === "object") {
+            const record = entry as Record<string, unknown>;
+            const model = firstString(record.model, record.id, record.name);
+            const description = firstString(record.description, record.desc);
+            return model ? [{ model, description }] : [];
+          }
+          return [];
+        });
+      }
+      if (parsed && typeof parsed === "object") {
+        return Object.entries(parsed as Record<string, unknown>).flatMap(([model, description]) => {
+          if (typeof description === "string") {
+            return [{ model, description }];
+          }
+          return [{ model }];
+        });
+      }
+    } catch {
+      return [{ model: trimmed, description: `Configured via ${source}` }];
+    }
+  }
+
+  return trimmed
+    .split(/[,\n]/)
+    .map(entry => entry.trim())
+    .filter(Boolean)
+    .map(entry => {
+      const eqIndex = entry.indexOf("=");
+      if (eqIndex > 0) {
+        return {
+          model: entry.slice(0, eqIndex).trim(),
+          description: entry.slice(eqIndex + 1).trim() || undefined,
+        };
+      }
+      return { model: entry };
+    });
+}
+
+interface EnvAliasEntry {
+  alias: string;
+  target: string;
+}
+
+function parseEnvAliasEntries(
+  value: string | undefined,
+  source: string,
+  cli: CliType
+): EnvAliasEntry[] {
+  if (!value) {
+    return [];
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return [];
+  }
+
+  const entries: EnvAliasEntry[] = [];
+  const addEntry = (rawAlias: string, rawTarget: unknown) => {
+    if (typeof rawTarget !== "string") {
+      return;
+    }
+    let alias = rawAlias.trim();
+    if (source === "LLM_GATEWAY_MODEL_ALIASES") {
+      const prefix = `${cli}.`;
+      if (!alias.startsWith(prefix)) {
+        return;
+      }
+      alias = alias.slice(prefix.length);
+    }
+    entries.push({ alias, target: rawTarget });
+  };
+
+  if (trimmed.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        Object.entries(parsed as Record<string, unknown>).forEach(([alias, target]) =>
+          addEntry(alias, target)
+        );
+        return entries;
+      }
+    } catch {
+      return [];
+    }
+  }
+
+  trimmed.split(/[,\n]/).forEach(entry => {
+    const eqIndex = entry.indexOf("=");
+    if (eqIndex <= 0) {
+      return;
+    }
+    addEntry(entry.slice(0, eqIndex), entry.slice(eqIndex + 1));
+  });
+
+  return entries;
+}
+
+function firstString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+interface GeminiObservation {
+  model: string;
+  lastSeen: string;
+  lastSeenMs: number;
+  filePath: string;
+}
+
+function isModelDiscoveryDisabled(): boolean {
+  return (
+    process.env.LLM_GATEWAY_DISABLE_MODEL_DISCOVERY === "1" ||
+    process.env.GEMINI_DISABLE_HISTORY_DISCOVERY === "1"
+  );
+}
+
+function parsePositiveInt(value: string | undefined, fallback: number): number {
+  if (!value) {
+    return fallback;
+  }
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function collectGeminiModels(): GeminiObservation[] {
+  const root = process.env.GEMINI_HISTORY_ROOT || path.join(homedir(), ".gemini", "tmp");
+  if (!existsSync(root)) {
+    return [];
+  }
+
+  const maxFiles = parsePositiveInt(process.env.GEMINI_HISTORY_MAX_FILES, MAX_GEMINI_HISTORY_FILES);
+  const maxFileBytes = parsePositiveInt(
+    process.env.GEMINI_HISTORY_MAX_FILE_BYTES,
+    MAX_GEMINI_HISTORY_FILE_BYTES
+  );
+  const candidates: { filePath: string; mtimeMs: number; size: number }[] = [];
+  const roots = safeReadDir(root);
+  roots.forEach(entry => {
+    if (!entry.isDirectory()) {
+      return;
+    }
+    const chatsPath = path.join(root, entry.name, "chats");
+    if (!existsSync(chatsPath)) {
+      return;
+    }
+    safeReadDir(chatsPath).forEach(file => {
+      if (!file.isFile() || !file.name.endsWith(".json")) {
+        return;
+      }
+      const filePath = path.join(chatsPath, file.name);
+      try {
+        const stat = statSync(filePath);
+        if (stat.size <= maxFileBytes) {
+          candidates.push({ filePath, mtimeMs: stat.mtimeMs, size: stat.size });
+        }
+      } catch {
+        return;
+      }
+    });
+  });
+
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  const recent = candidates.slice(0, maxFiles);
+
+  const models: Record<string, GeminiObservation> = {};
+  for (const candidate of recent) {
+    extractGeminiModels(candidate.filePath).forEach(model => {
+      const existing = models[model]?.lastSeenMs ?? 0;
+      if (candidate.mtimeMs > existing) {
+        models[model] = {
+          model,
+          lastSeen: formatDate(candidate.mtimeMs),
+          lastSeenMs: candidate.mtimeMs,
+          filePath: candidate.filePath,
+        };
+      }
+    });
+  }
+
+  return Object.values(models).sort((a, b) => {
+    const versionDiff = extractModelVersion(b.model) - extractModelVersion(a.model);
+    if (versionDiff !== 0) {
+      return versionDiff;
+    }
+    return b.lastSeenMs - a.lastSeenMs;
+  });
+}
+
+function extractGeminiModels(filePath: string): string[] {
+  try {
+    const content = readFileSync(filePath, "utf-8");
+    const found = new Set<string>();
+    try {
+      collectModelValues(JSON.parse(content), found);
+    } catch {
+      const regex = /"model(?:Name|Id)?"\s*:\s*"([^"]+)"/g;
+      let match: RegExpExecArray | null;
+      while ((match = regex.exec(content)) !== null) {
+        found.add(match[1]);
+      }
+    }
+    return [...found].filter(isValidModelName).slice(0, 20);
+  } catch {
+    return [];
+  }
+}
+
+function collectModelValues(value: unknown, found: Set<string>): void {
+  if (!value || found.size >= 20) {
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach(entry => collectModelValues(entry, found));
+    return;
+  }
+  if (typeof value !== "object") {
+    return;
+  }
+  Object.entries(value as Record<string, unknown>).forEach(([key, child]) => {
+    if (
+      (key === "model" || key === "modelName" || key === "modelId") &&
+      typeof child === "string"
+    ) {
+      found.add(child);
+    } else {
+      collectModelValues(child, found);
+    }
+  });
+}
+
+function formatDate(timestampMs: number): string {
+  try {
+    return new Date(timestampMs).toISOString().slice(0, 10);
+  } catch {
+    return "unknown";
+  }
+}
+
+function extractModelVersion(model: string): number {
+  const match = model.match(/(\d+(?:\.\d+)?)/);
+  if (!match) {
+    return 0;
+  }
+  const parsed = Number.parseFloat(match[1]);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function safeReadDir(dirPath: string): Dirent[] {
+  try {
+    return readdirSync(dirPath, { withFileTypes: true, encoding: "utf8" });
+  } catch {
+    return [];
+  }
+}
+
+function buildOrder(info: CliInfo, preferred?: string): string[] {
+  const order: string[] = [];
+  const seen = new Set<string>();
+
+  if (preferred && info.models[preferred]) {
+    order.push(preferred);
+    seen.add(preferred);
+  }
+
+  if (info.modelOrder) {
+    info.modelOrder.forEach(model => {
+      if (!seen.has(model) && info.models[model]) {
+        order.push(model);
+        seen.add(model);
+      }
+    });
+  }
+
+  Object.keys(info.models).forEach(model => {
+    if (!seen.has(model)) {
+      order.push(model);
+      seen.add(model);
+    }
+  });
+
+  return order;
+}
+
+function pickLatestMatching(info: CliInfo, token: string): string | undefined {
+  const normalized = token.toLowerCase();
+  const candidates = Object.keys(info.models)
+    .filter(model => model.toLowerCase().includes(normalized))
+    .sort((a, b) => {
+      const versionDiff = extractModelVersion(b) - extractModelVersion(a);
+      if (versionDiff !== 0) {
+        return versionDiff;
+      }
+      const aMetadata = info.modelMetadata?.[a];
+      const bMetadata = info.modelMetadata?.[b];
+      const priorityDiff =
+        (bMetadata ? SOURCE_PRIORITY[bMetadata.source] : 0) -
+        (aMetadata ? SOURCE_PRIORITY[aMetadata.source] : 0);
+      if (priorityDiff !== 0) {
+        return priorityDiff;
+      }
+      return a.localeCompare(b);
+    });
+  return candidates[0];
+}

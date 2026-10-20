@@ -1,0 +1,325 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "llm-cli-gateway MCP HTTP API",
+    "version": "3.2.1",
+    "description": "Streamable HTTP MCP endpoint for llm-cli-gateway. Local stdio remains the default and HTTP is opt-in. The documented default /mcp endpoint uses a configured static bearer token; the built-in OAuth 2.0 server is optional."
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:3333",
+      "description": "Default local HTTP transport"
+    }
+  ],
+  "paths": {
+    "/mcp": {
+      "post": {
+        "operationId": "mcpJsonRpc",
+        "summary": "Send an MCP JSON-RPC request",
+        "description": "Streamable HTTP endpoint used by MCP clients for initialize, tools/list, tools/call, resource reads, and session lifecycle requests.",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "oauth2": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JsonRpcRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "MCP JSON-RPC response or streamable HTTP response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JsonRpcResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/JsonError"
+          },
+          "401": {
+            "$ref": "#/components/responses/JsonError"
+          },
+          "404": {
+            "$ref": "#/components/responses/JsonError"
+          },
+          "405": {
+            "$ref": "#/components/responses/JsonError"
+          },
+          "413": {
+            "$ref": "#/components/responses/JsonError"
+          },
+          "429": {
+            "$ref": "#/components/responses/JsonError"
+          },
+          "500": {
+            "$ref": "#/components/responses/JsonError"
+          },
+          "503": {
+            "$ref": "#/components/responses/JsonError"
+          }
+        }
+      },
+      "get": {
+        "operationId": "mcpStream",
+        "summary": "Continue a Streamable HTTP MCP session",
+        "description": "Continue an initialized MCP session. Send the session identifier in the Mcp-Session-Id header.",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "oauth2": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "Mcp-Session-Id",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Streamable HTTP MCP response"
+          },
+          "401": {
+            "$ref": "#/components/responses/JsonError"
+          },
+          "404": {
+            "$ref": "#/components/responses/JsonError"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "mcpDeleteSession",
+        "summary": "Close a Streamable HTTP MCP session",
+        "description": "Close the session identified by the Mcp-Session-Id header. Closing an already absent session is acknowledged with 204.",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "oauth2": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "Mcp-Session-Id",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Session closed"
+          },
+          "400": {
+            "$ref": "#/components/responses/JsonError"
+          },
+          "401": {
+            "$ref": "#/components/responses/JsonError"
+          }
+        }
+      }
+    },
+    "/healthz": {
+      "get": {
+        "operationId": "healthz",
+        "summary": "Read HTTP gateway liveness and readiness",
+        "description": "Unauthenticated local reverse-proxy and tunnel monitor endpoint. ok reports process liveness; ready, when present, reports durable-admission readiness.",
+        "responses": {
+          "200": {
+            "description": "Gateway health summary",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "ready": {
+                      "type": "boolean",
+                      "description": "Present when an async job manager is attached; false means durable admission is unavailable."
+                    },
+                    "sessions": {
+                      "type": "object"
+                    },
+                    "memory": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "ok"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Static bearer token supplied with LLM_GATEWAY_AUTH_TOKEN. All callers sharing this token use the same gateway principal."
+      },
+      "oauth2": {
+        "type": "oauth2",
+        "description": "Built-in OAuth 2.0 server with PKCE and scoped tokens.",
+        "flows": {
+          "authorizationCode": {
+            "authorizationUrl": "http://127.0.0.1:3333/oauth/authorize",
+            "tokenUrl": "http://127.0.0.1:3333/oauth/token",
+            "scopes": {
+              "mcp": "Default connector scope for a gateway OAuth client.",
+              "workspace:admin": "Create or register remote workspace aliases when LLM_GATEWAY_WORKSPACE_ADMIN=1.",
+              "cli:admin": "Run remote provider-admin operations when LLM_GATEWAY_CLI_ADMIN=1."
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "JsonRpcRequest": {
+        "type": "object",
+        "properties": {
+          "jsonrpc": {
+            "type": "string",
+            "const": "2.0"
+          },
+          "id": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "number"
+              }
+            ]
+          },
+          "method": {
+            "type": "string",
+            "examples": [
+              "initialize",
+              "tools/list",
+              "tools/call"
+            ]
+          },
+          "params": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "jsonrpc",
+          "method"
+        ]
+      },
+      "JsonRpcResponse": {
+        "type": "object",
+        "properties": {
+          "jsonrpc": {
+            "type": "string",
+            "const": "2.0"
+          },
+          "id": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "result": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "error": {
+            "$ref": "#/components/schemas/JsonRpcError"
+          }
+        },
+        "required": [
+          "jsonrpc"
+        ]
+      },
+      "JsonError": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "retryable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "additionalProperties": true
+      },
+      "JsonRpcError": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "integer"
+          },
+          "message": {
+            "type": "string"
+          },
+          "data": {}
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": true
+      }
+    },
+    "responses": {
+      "JsonError": {
+        "description": "JSON error response",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/JsonError"
+            }
+          }
+        }
+      }
+    }
+  }
+}

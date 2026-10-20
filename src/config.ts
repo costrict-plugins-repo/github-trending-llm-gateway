@@ -1,0 +1,2249 @@
+import { existsSync, readFileSync } from "fs";
+import os from "os";
+import path from "path";
+import { createRequire } from "module";
+import { z } from "zod/v3";
+import type { Logger } from "./logger.js";
+import { logWarn, noopLogger } from "./logger.js";
+import type { RemoteOAuthConfig, OAuthRegistrationPolicy } from "./auth.js";
+import { hashSecret, isSecretHash } from "./oauth.js";
+import { isHttpsOrLoopbackUrl, isLoopbackUrl } from "./api-http.js";
+import type { ApiProviderKind } from "./api-provider.js";
+import { CLI_TYPES } from "./provider-types.js";
+import { carriesPostgresDsnScheme } from "./storage/roles.js";
+import type { StorageRoleDsns } from "./storage/roles.js";
+import {
+  DEFAULT_RETENTION_SWEEP_INTERVAL_MS,
+  resolveRetentionPolicy,
+  type RetentionPolicy,
+} from "./storage/retention.js";
+import type { QualityTier } from "./least-cost-types.js";
+
+// Zod schemas for configuration validation
+const DatabaseUrlSchema = z.string().min(1).refine(carriesPostgresDsnScheme, {
+  message: "Database URL must start with postgresql:// or postgres://",
+});
+
+export interface DatabaseConfig {
+  connectionString: string;
+  pool: {
+    max: number;
+    idleTimeoutMillis: number;
+    connectionTimeoutMillis: number;
+    statementTimeout: number;
+  };
+}
+
+export const DEFAULT_SESSION_TTL_SECONDS = 2592000; // 30 days
+
+export interface Config {
+  database?: DatabaseConfig;
+  /**
+   * Per-role credentials for the session store's driver, from
+   * `[persistence.roles]`. Empty unless `[persistence]` selected the database:
+   * a legacy `DATABASE_URL` deployment has one credential by definition.
+   */
+  roleDsns?: StorageRoleDsns;
+  sessionTtl: number; // Session expiration in seconds
+  /**
+   * Which selector chose {@link Config.database}, so a startup failure can name
+   * the configuration the operator actually wrote rather than just reporting a
+   * refused connection.
+   */
+  databaseSource?: "persistence" | "env";
+}
+
+const SkillsSchema = z
+  .object({
+    paths: z.array(z.string().min(1)).default([]),
+  })
+  .strict()
+  .default({ paths: [] });
+
+export interface SkillsConfig {
+  paths: string[];
+  sources: {
+    configFile: string | null;
+    envOverrides: string[];
+  };
+}
+
+let warnedSessionDatabaseUrl = false;
+
+/** What happened to a set `DATABASE_URL`. */
+export type DatabaseUrlOutcome =
+  /** Not set. */
+  | "absent"
+  /** No `[persistence]` at all, so the legacy variable is the only signal. */
+  | "honoured"
+  /** Set, and identical to `[persistence].dsn`. */
+  | "redundant"
+  /** Set, and pointing somewhere other than `[persistence].dsn`. */
+  | "ignored_conflict"
+  /** Set, under an explicitly configured non-postgres backend. */
+  | "ignored_explicit_backend";
+
+export interface DatabaseUrlDecision {
+  outcome: DatabaseUrlOutcome;
+  /** The DSN the session store will use, or null for file storage. */
+  connectionString: string | null;
+  /** Operator-facing explanation; null only when there is nothing to explain. */
+  reason: string | null;
+}
+
+/**
+ * The `DATABASE_URL` precedence rule, as DATA.
+ *
+ * It was a chain of `if`s inside `loadConfig`, so the only way to find out what
+ * a given combination does was to run the loader and read stderr. A conflict is
+ * REFUSED rather than resolved, which is the right answer, but a refusal an
+ * operator can only learn from a one-time warning at boot is not much better
+ * than a silent one. Returning the decision lets `loadConfig` warn and
+ * `storage-disposition.ts` report the same determination without restating the
+ * rule, and lets the precedence matrix be tested cell by cell.
+ */
+export function resolveDatabaseUrlPrecedence(input: {
+  databaseUrl: string | undefined;
+  persistenceDsn: string | null;
+  explicitBackend: boolean;
+  backend: PersistenceBackend;
+}): DatabaseUrlDecision {
+  const { persistenceDsn, explicitBackend, backend } = input;
+  const databaseUrl = input.databaseUrl?.trim();
+  if (!databaseUrl) {
+    return { outcome: "absent", connectionString: persistenceDsn, reason: null };
+  }
+  if (persistenceDsn && databaseUrl !== persistenceDsn) {
+    return {
+      outcome: "ignored_conflict",
+      connectionString: persistenceDsn,
+      reason:
+        "DATABASE_URL is deprecated for session storage and disagrees with " +
+        "[persistence].dsn; ignoring it. The session store follows [persistence] " +
+        "so sessions and jobs cannot land in different databases.",
+    };
+  }
+  if (persistenceDsn) {
+    if (!explicitBackend) {
+      return {
+        outcome: "honoured",
+        connectionString: persistenceDsn,
+        reason:
+          "DATABASE_URL is deprecated; because no [persistence] backend is configured, " +
+          "it selects PostgreSQL for every backend-governed durable subsystem. Move the " +
+          'same URL to [persistence].dsn with backend = "postgres".',
+      };
+    }
+    return {
+      outcome: "redundant",
+      connectionString: persistenceDsn,
+      reason:
+        "DATABASE_URL is deprecated for session storage and duplicates " +
+        "[persistence].dsn, which is what the session store follows. Remove the " +
+        "variable; it will stop being read in a later release.",
+    };
+  }
+  if (explicitBackend) {
+    // Another persistence selector has chosen where durable state lives.
+    // Honouring DATABASE_URL here would put sessions in Postgres while jobs
+    // stayed on that backend: the exact split this selector exists to prevent.
+    return {
+      outcome: "ignored_explicit_backend",
+      connectionString: null,
+      reason:
+        "DATABASE_URL is set but the persistence backend is already selected as " +
+        `"${backend}"; ignoring it. Honouring it would put sessions in ` +
+        "Postgres while jobs stay on the configured backend. Remove the variable, or " +
+        'set [persistence] backend = "postgres" with a dsn.',
+    };
+  }
+  // No persistence configured at all: the legacy variable is still the only
+  // signal an older deployment has, so it is honoured with a warning.
+  return {
+    outcome: "honoured",
+    connectionString: databaseUrl,
+    reason:
+      "DATABASE_URL is deprecated for session storage; set [persistence] " +
+      'backend = "postgres" with a dsn in ~/.llm-cli-gateway/config.toml instead.',
+  };
+}
+
+/**
+ * Load configuration for the session manager.
+ *
+ * The session store follows `[persistence]`, the same selector the job store
+ * and validation runs already use. It previously had a selector of its own,
+ * `DATABASE_URL`, and nothing set it: `createSessionManager` therefore took the
+ * file branch on a host whose `[persistence].backend` was `"postgres"`, and the
+ * sessions quietly stayed in `~/.llm-cli-gateway/sessions.json` while every
+ * other subsystem was on Postgres. One database, two ways to select it, and the
+ * subsystem nobody wired up kept its own file.
+ *
+ * `DATABASE_URL` remains as a deprecated override that warns once, matching the
+ * treatment of `LLM_GATEWAY_LOGS_DB` / `LLM_GATEWAY_JOBS_DB`. It must never
+ * silently rewrite an explicit backend: a variable named for one subsystem
+ * overriding another subsystem's explicit configuration is exactly the defect
+ * fixed in 3.1.0-rc.3.
+ *
+ * A conflict does NOT abort startup, deliberately. See
+ * `storage-unification.dag.toml`, node s9: the outcome is already fully
+ * determined and is the one the config file describes, so there is nothing left
+ * for an abort to protect, and refusing to boot would take down a working
+ * deployment over a variable the gateway is ignoring anyway.
+ *
+ * @param persistence Resolved persistence config; omitted, it is loaded.
+ * @param logger Logger for the one-time deprecation warning.
+ */
+export function loadConfig(
+  persistence: PersistenceConfig = loadPersistenceConfig(),
+  logger: Logger = noopLogger
+): Config {
+  const rawSessionTtl = parseInt(
+    process.env.SESSION_TTL || String(DEFAULT_SESSION_TTL_SECONDS),
+    10
+  );
+  const sessionTtl =
+    Number.isFinite(rawSessionTtl) && rawSessionTtl > 0
+      ? rawSessionTtl
+      : DEFAULT_SESSION_TTL_SECONDS;
+
+  const persistenceDsn = persistence.backend === "postgres" ? persistence.dsn : null;
+  const backendSelectedOutsideDatabaseUrl =
+    persistence.explicitBackend ||
+    persistence.sources.envOverrides.some(
+      source => source === "LLM_GATEWAY_JOBS_DB" || source === "LLM_GATEWAY_LOGS_DB"
+    );
+  const decision = resolveDatabaseUrlPrecedence({
+    databaseUrl: process.env.DATABASE_URL,
+    persistenceDsn,
+    explicitBackend: backendSelectedOutsideDatabaseUrl,
+    backend: persistence.backend,
+  });
+  if (decision.reason && !warnedSessionDatabaseUrl) {
+    warnedSessionDatabaseUrl = true;
+    logger.warn?.(decision.reason);
+  }
+
+  const connectionString = decision.connectionString;
+
+  // No Postgres selected: file-based storage.
+  if (!connectionString) {
+    return { sessionTtl };
+  }
+
+  // Validate the category only. PostgreSQL accepts URI forms, including
+  // hostless socket URLs with userinfo, that WHATWG URL parsers reject. The
+  // driver owns the rest of the syntax and connection validation.
+  let validatedConnectionString: string;
+  try {
+    validatedConnectionString = DatabaseUrlSchema.parse(connectionString);
+  } catch (error) {
+    throw new Error(
+      `Invalid database URL: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error }
+    );
+  }
+
+  return {
+    database: {
+      connectionString: validatedConnectionString,
+      pool: {
+        max: 10,
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: 5000,
+        statementTimeout: 10000,
+      },
+    },
+    // Per-role credentials only ever come from `[persistence.roles]`, so a
+    // legacy DATABASE_URL deployment gets none and its driver holds `app`
+    // alone, which is what it holds today.
+    roleDsns: validatedConnectionString === persistenceDsn ? persistence.roleDsns : {},
+    sessionTtl,
+    databaseSource: persistence.sources.envOverrides.includes("DATABASE_URL")
+      ? "env"
+      : "persistence",
+  };
+}
+
+/** Reset the one-time DATABASE_URL warning. Tests only. */
+export function resetSessionDatabaseUrlWarning(): void {
+  warnedSessionDatabaseUrl = false;
+}
+
+//──────────────────────────────────────────────────────────────────────────────
+// Persistence configuration
+//
+// The async job store is now driven by a typed config (TOML file +
+// validated env-var overrides) instead of a single LLM_GATEWAY_LOGS_DB env
+// var. The structural invariant: `*_request_async` tools are only registered
+// when a real durable store is attached, so silent in-memory loss after the
+// 1h TTL becomes impossible.
+//
+// Backends:
+//   - "sqlite":   durable on disk (default).
+//   - "postgres": durable in Postgres.
+//   - "memory":   in-process MemoryJobStore. Process-lifetime durability only.
+//                 Requires acknowledgeEphemeral=true to register async tools.
+//   - "none":     no store. Async tools are NOT registered.
+//──────────────────────────────────────────────────────────────────────────────
+
+export const PERSISTENCE_BACKENDS = ["sqlite", "postgres", "memory", "none"] as const;
+export type PersistenceBackend = (typeof PERSISTENCE_BACKENDS)[number];
+
+export const DEFAULT_JOB_RETENTION_DAYS: number | null = null;
+export const DEFAULT_DEDUP_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+
+// Issue #139 (durable instance-lease orphan recovery): the lease/heartbeat/sweep
+// knobs. Defaults: heartbeat every 15s; a per-job lease TTL of 90s (6x
+// heartbeat) so up to five consecutive missed heartbeats never orphan a live
+// job; a larger 5-minute grace for no-pid http-transport jobs (their only
+// secondary liveness signal); a 30s reaper cadence; and a 1h GC horizon for the
+// observability-only gateway_instances rows. Zod enforces
+// leaseTtl >= 2*heartbeat, httpJobGrace >= leaseTtl, and a GC horizon no
+// shorter than the lease it observes.
+export const DEFAULT_INSTANCE_HEARTBEAT_MS = 15000;
+export const DEFAULT_INSTANCE_LEASE_TTL_MS = 90000;
+export const DEFAULT_HTTP_JOB_GRACE_MS = 300000;
+export const DEFAULT_ORPHAN_SWEEP_INTERVAL_MS = 30000;
+export const DEFAULT_INSTANCE_GC_MS = 3600000;
+
+/**
+ * `[persistence.roles]`: the credential per operation class, for a deployment
+ * that has provisioned the four-role RBAC in
+ * docs/plans/postgres-security-hardening.md section 4.3.
+ *
+ * `app` is NOT a key here. The runtime credential is `[persistence].dsn`, and
+ * accepting it twice would make "which one wins" a rule this table exists to
+ * remove. `migrate` is not a key either, for the reason `storage/roles.ts`
+ * gives: it is owner-equivalent and process-separated, so a long-running
+ * gateway holding it would be a privilege regression rather than a feature.
+ *
+ * `.strict()` is what makes a typo fail. `readr = "..."` under a permissive
+ * schema is silently no reader at all, so every transcript read quietly
+ * degrades onto `app` while the operator believes separation is in force.
+ */
+const PersistenceRolesSchema = z
+  .object({
+    reader: DatabaseUrlSchema.optional(),
+    analytics: DatabaseUrlSchema.optional(),
+    retention: DatabaseUrlSchema.optional(),
+  })
+  .strict();
+
+/** Keys refused with a reason rather than with zod's "unrecognized key". */
+const REFUSED_ROLE_KEYS: Readonly<Record<string, string>> = {
+  app: "the `app` credential is [persistence].dsn; remove it from [persistence.roles]",
+  migrate:
+    "the migrate credential is owner-equivalent and process-separated for `npm run migrate`; a running gateway must not hold it",
+};
+
+/**
+ * `[persistence.retention]`: one bound per subsystem the storage port carries.
+ *
+ * `.strict()` for the same reason `[persistence.roles]` is: a misspelled key
+ * under a permissive schema is silently no bound at all, and the operator has
+ * no way to tell that from a bound that ran and found nothing.
+ *
+ * `jobs` is an override for the deprecated `[persistence].retentionDays` key.
+ * Every transcript bound defaults to OFF: leaving them out deletes nothing.
+ */
+const PersistenceRetentionSchema = z
+  .object({
+    jobs: z.number().positive().optional(),
+    requests: z.number().positive().optional(),
+    wedgedValidationRuns: z.number().min(1).optional(),
+    sweepIntervalMs: z.number().int().positive().default(DEFAULT_RETENTION_SWEEP_INTERVAL_MS),
+  })
+  .strict();
+
+const PersistenceSchema = z
+  .object({
+    backend: z.enum(PERSISTENCE_BACKENDS).default("sqlite"),
+    roles: PersistenceRolesSchema.optional(),
+    path: z.string().optional(),
+    // Round 13 BLOCKER. This was a bare `z.string()`, the ONE connection string
+    // with no scheme check while `reader`, `analytics` and `retention` all had
+    // one. `redactDsn(roleDsns.app)` feeds the startup log line, and pg parses
+    // a string with no authority by putting the input in the PATH, so a
+    // leading space or a missing slash here printed the operator's password.
+    // The gate in `flight-recorder-pg.ts` now refuses the same shapes; this is
+    // the half that stops them reaching a live connection at all.
+    dsn: DatabaseUrlSchema.optional(),
+    retentionDays: z.number().positive().nullable().default(DEFAULT_JOB_RETENTION_DAYS),
+    retention: PersistenceRetentionSchema.default({}),
+    dedupWindowMs: z.number().int().nonnegative().default(DEFAULT_DEDUP_WINDOW_MS),
+    acknowledgeEphemeral: z.boolean().default(false),
+    // Issue #139 (interim gate, DEPRECATED): superseded by the durable per-job
+    // lease. Still parsed for one release so existing configs do not error, but
+    // it is no longer load-bearing: the lease recovery is safe to run from every
+    // instance (heartbeat and sweep serialize on the job row), so no instance
+    // needs to be the designated sweep "owner". loadPersistenceConfig emits a
+    // one-time deprecation warning when it is set. Will be removed in a later
+    // release. See the durable lease knobs below.
+    ownsOrphanRecovery: z.boolean().default(false),
+    // Issue #139 (durable lease): heartbeat/lease/sweep/GC cadences (ms).
+    instanceHeartbeatMs: z.number().int().positive().default(DEFAULT_INSTANCE_HEARTBEAT_MS),
+    instanceLeaseTtlMs: z.number().int().positive().default(DEFAULT_INSTANCE_LEASE_TTL_MS),
+    httpJobGraceMs: z.number().int().positive().default(DEFAULT_HTTP_JOB_GRACE_MS),
+    orphanSweepIntervalMs: z.number().int().positive().default(DEFAULT_ORPHAN_SWEEP_INTERVAL_MS),
+    instanceGcMs: z.number().int().positive().default(DEFAULT_INSTANCE_GC_MS),
+  })
+  .strict()
+  .superRefine((cfg, ctx) => {
+    // A lease must survive at least one missed heartbeat, so require it to be at
+    // least twice the heartbeat cadence; otherwise a single delayed heartbeat
+    // could let another instance sweep a live job.
+    if (cfg.instanceLeaseTtlMs < 2 * cfg.instanceHeartbeatMs) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["instanceLeaseTtlMs"],
+        message: `instanceLeaseTtlMs (${cfg.instanceLeaseTtlMs}) must be >= 2 * instanceHeartbeatMs (${2 * cfg.instanceHeartbeatMs})`,
+      });
+    }
+    // The http grace is an EXTRA hold on top of the lease for no-pid jobs, so it
+    // can never be shorter than the lease itself.
+    if (cfg.httpJobGraceMs < cfg.instanceLeaseTtlMs) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["httpJobGraceMs"],
+        message: `httpJobGraceMs (${cfg.httpJobGraceMs}) must be >= instanceLeaseTtlMs (${cfg.instanceLeaseTtlMs})`,
+      });
+    }
+    // gateway_instances is observability data, but the advisory same-host PID
+    // grace uses its hostname. Do not GC a live instance row before the lease
+    // window that still treats its owned job as active.
+    if (cfg.instanceGcMs < cfg.instanceLeaseTtlMs) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["instanceGcMs"],
+        message: `instanceGcMs (${cfg.instanceGcMs}) must be >= instanceLeaseTtlMs (${cfg.instanceLeaseTtlMs})`,
+      });
+    }
+  });
+
+export interface PersistenceConfig {
+  backend: PersistenceBackend;
+  path: string | null;
+  dsn: string | null;
+  /**
+   * Every credential the Postgres driver should hold, `app` included.
+   *
+   * Empty on a non-postgres backend. `PostgresStorageDriver` has accepted a
+   * per-role DSN map since s4 and nothing produced one, so its per-role pools
+   * were unreachable from configuration and every operation class degraded onto
+   * `app`. This is the half of design 3.1 that unifies the POOL rather than the
+   * selector.
+   */
+  roleDsns: StorageRoleDsns;
+  /**
+   * Deprecated job-store bound. Null means unbounded; use retention.days.jobs.
+   */
+  retentionDays: number | null;
+  /**
+   * Every bound, resolved once. `doctor` and `llm_process_health` report this
+   * rather than each deciding for itself which subsystems are unbounded.
+   *
+   * OPTIONAL, and `loadPersistenceConfig` always sets it. Read it through
+   * `persistenceRetentionPolicy`, never directly: this object is constructed by
+   * hand at 58 test call sites, and a required field there would be a runtime
+   * `undefined` in every one of them rather than a compile error in any.
+   */
+  retention?: RetentionPolicy;
+  /** How often the retention sweeper ticks. Never on the request path. */
+  retentionSweepIntervalMs?: number;
+  dedupWindowMs: number;
+  acknowledgeEphemeral: boolean;
+  /**
+   * Issue #139 (interim gate, DEPRECATED): retained only so old configs still
+   * parse. No longer load-bearing (the durable per-job lease recovery runs
+   * safely from every instance). loadPersistenceConfig warns once when it is
+   * explicitly set. See PersistenceSchema.
+   */
+  ownsOrphanRecovery: boolean;
+  /** Issue #139 (durable lease): heartbeat cadence in ms. */
+  instanceHeartbeatMs: number;
+  /** Issue #139 (durable lease): per-job fencing lease TTL in ms. */
+  instanceLeaseTtlMs: number;
+  /** Issue #139 (durable lease): extra grace for no-pid http-transport jobs in ms. */
+  httpJobGraceMs: number;
+  /** Issue #139 (durable lease): reaper sweep cadence in ms. */
+  orphanSweepIntervalMs: number;
+  /** Issue #139 (durable lease): gateway_instances GC horizon in ms. */
+  instanceGcMs: number;
+  /** True iff async-job tools should be registered on the MCP server. */
+  asyncJobsEnabled: boolean;
+  /** Audit trail: which inputs (file, env vars) contributed to the resolved config. */
+  sources: PersistenceConfigSources;
+  /**
+   * True when `[persistence].backend` was written down, rather than defaulted.
+   *
+   * The distinction is load-bearing for session-store selection: honouring a
+   * legacy `DATABASE_URL` under an EXPLICIT non-postgres backend puts sessions
+   * in Postgres while jobs stay on the selected backend, which is the split
+   * this configuration exists to prevent. "Nobody configured persistence" and
+   * "an operator chose sqlite" are different states and must not be conflated.
+   */
+  explicitBackend: boolean;
+}
+
+export interface PersistenceConfigSources {
+  configFile: string | null;
+  envOverrides: string[];
+}
+
+const DEFAULT_SQLITE_PATH = path.join(os.homedir(), ".llm-cli-gateway", "logs.db");
+
+function defaultPersistenceConfigPath(): string {
+  return (
+    process.env.LLM_GATEWAY_CONFIG ?? path.join(os.homedir(), ".llm-cli-gateway", "config.toml")
+  );
+}
+
+export function defaultGatewayConfigPath(): string {
+  return defaultPersistenceConfigPath();
+}
+
+export function loadSkillsConfig(logger: Logger = noopLogger): SkillsConfig {
+  const configPath = defaultGatewayConfigPath();
+  const { parsed, sourcePath } = readGatewayTomlFile(configPath, logger, "skills");
+  const rawSkills = (parsed?.skills as Record<string, unknown> | undefined) ?? {};
+  const sources = {
+    configFile: sourcePath,
+    envOverrides: [] as string[],
+  };
+
+  let skillsParsed;
+  try {
+    skillsParsed = SkillsSchema.parse(rawSkills);
+  } catch (err) {
+    throw new Error(
+      `Invalid [skills] config: ${err instanceof Error ? err.message : String(err)}`,
+      {
+        cause: err,
+      }
+    );
+  }
+
+  const paths = [...skillsParsed.paths];
+  const envPaths = process.env.LLM_GATEWAY_SKILLS_PATH;
+  if (envPaths !== undefined && envPaths.trim().length > 0) {
+    paths.push(
+      ...envPaths
+        .split(path.delimiter)
+        .map(part => part.trim())
+        .filter(Boolean)
+    );
+    sources.envOverrides.push("LLM_GATEWAY_SKILLS_PATH");
+  }
+
+  return { paths, sources };
+}
+
+/**
+ * Read and parse the optional TOML config file. Returns the raw `[persistence]`
+ * table (if present) and the file path. Missing file is fine — defaults apply.
+ */
+function readPersistenceFile(
+  configPath: string,
+  logger: Logger
+): { raw: unknown; sourcePath: string | null } {
+  if (!existsSync(configPath)) {
+    return { raw: undefined, sourcePath: null };
+  }
+  try {
+    const require = createRequire(import.meta.url);
+    const TOML = require("smol-toml");
+    const text = readFileSync(configPath, "utf-8");
+    const parsed = TOML.parse(text) as Record<string, unknown>;
+    return { raw: parsed?.persistence, sourcePath: configPath };
+  } catch (err) {
+    logger.error(`Failed to parse gateway config at ${configPath}; refusing defaults`, err);
+    throw new Error(`Failed to parse gateway config at ${configPath}`, { cause: err });
+  }
+}
+
+function readGatewayTomlFile(
+  configPath: string,
+  logger: Logger,
+  fallbackLabel: string
+): { parsed: Record<string, unknown> | null; sourcePath: string | null } {
+  if (!existsSync(configPath)) {
+    return { parsed: null, sourcePath: null };
+  }
+  try {
+    const require = createRequire(import.meta.url);
+    const TOML = require("smol-toml");
+    const text = readFileSync(configPath, "utf-8");
+    return { parsed: TOML.parse(text) as Record<string, unknown>, sourcePath: configPath };
+  } catch (err) {
+    logger.error(
+      `Failed to parse gateway config at ${configPath}; using ${fallbackLabel} defaults`,
+      err
+    );
+    return { parsed: null, sourcePath: null };
+  }
+}
+
+/**
+ * Apply legacy env-var overrides on top of the file/defaults. Each application
+ * appends a string to `sources.envOverrides` and emits a one-time deprecation
+ * warning so operators can migrate to the config file.
+ */
+function applyEnvOverrides(
+  base: Record<string, unknown>,
+  logger: Logger,
+  sources: PersistenceConfigSources
+): Record<string, unknown> {
+  const out = { ...base };
+
+  const jobsDbEnv = process.env.LLM_GATEWAY_JOBS_DB;
+  const logsDbEnv = process.env.LLM_GATEWAY_LOGS_DB;
+  // Empty or whitespace-only input is treated as "not set". Only a value with
+  // content (including the literal "none") overrides the file/defaults. This avoids the
+  // old footgun where `LLM_GATEWAY_LOGS_DB=` silently disabled persistence.
+  const dbEnvName = jobsDbEnv?.trim()
+    ? "LLM_GATEWAY_JOBS_DB"
+    : logsDbEnv?.trim()
+      ? "LLM_GATEWAY_LOGS_DB"
+      : undefined;
+  const dbEnvRaw =
+    dbEnvName === "LLM_GATEWAY_JOBS_DB"
+      ? jobsDbEnv
+      : dbEnvName === "LLM_GATEWAY_LOGS_DB"
+        ? logsDbEnv
+        : undefined;
+  if (dbEnvName !== undefined && dbEnvRaw !== undefined) {
+    const normalized = dbEnvRaw.trim().toLowerCase();
+    // A PATH in these deprecated variables must not silently rewrite an
+    // explicit backend. Previously it always won, so setting
+    // LLM_GATEWAY_LOGS_DB (a variable named for the flight recorder, a
+    // different subsystem) rewrote an explicit `backend = "postgres"` or
+    // `"memory"` to "sqlite". A config file being overridden by a variable that
+    // does not appear to be about it is the worst kind of precedence rule.
+    // The same precedence applies to `none`. LLM_GATEWAY_LOGS_DB remains the
+    // recorder's independent off switch, but it no longer rewrites an explicit
+    // job-persistence backend as a side effect.
+    const explicitBackend = Object.hasOwn(base, "backend");
+    if (explicitBackend) {
+      logWarn(
+        logger,
+        `${dbEnvName} is set but [persistence].backend is explicitly configured; the config file wins. Remove the environment variable.`,
+        { backend: base.backend }
+      );
+      return out;
+    }
+    if (normalized === "none") {
+      out.backend = "none";
+      out.path = undefined;
+    } else {
+      out.backend = "sqlite";
+      out.path = dbEnvRaw.trim();
+    }
+    const which = dbEnvName;
+    sources.envOverrides.push(which);
+    logWarn(
+      logger,
+      `${which} is deprecated; migrate to [persistence] in ~/.llm-cli-gateway/config.toml`,
+      { backend: out.backend, path: out.path ?? null }
+    );
+  }
+
+  const retEnv = process.env.LLM_GATEWAY_JOB_RETENTION_DAYS;
+  if (retEnv?.trim()) {
+    const n = Number(retEnv);
+    if (!Number.isFinite(n) || n <= 0) {
+      throw new Error("LLM_GATEWAY_JOB_RETENTION_DAYS must be a positive number when set");
+    }
+    out.retentionDays = n;
+    sources.envOverrides.push("LLM_GATEWAY_JOB_RETENTION_DAYS");
+    logWarn(
+      logger,
+      "LLM_GATEWAY_JOB_RETENTION_DAYS is deprecated; set [persistence].retentionDays in config.toml",
+      { retentionDays: n }
+    );
+  }
+
+  const dedupEnv = process.env.LLM_GATEWAY_DEDUP_WINDOW_MS;
+  if (dedupEnv !== undefined) {
+    const n = Number(dedupEnv);
+    if (Number.isFinite(n) && n >= 0) {
+      out.dedupWindowMs = n;
+      sources.envOverrides.push("LLM_GATEWAY_DEDUP_WINDOW_MS");
+      logWarn(
+        logger,
+        "LLM_GATEWAY_DEDUP_WINDOW_MS is deprecated; set [persistence].dedupWindowMs in config.toml",
+        { dedupWindowMs: n }
+      );
+    }
+  }
+
+  const ackEnv = process.env.LLM_GATEWAY_ACKNOWLEDGE_EPHEMERAL;
+  if (ackEnv && ackEnv.length > 0) {
+    out.acknowledgeEphemeral = /^(1|true|yes)$/i.test(ackEnv.trim());
+    sources.envOverrides.push("LLM_GATEWAY_ACKNOWLEDGE_EPHEMERAL");
+    logWarn(
+      logger,
+      "LLM_GATEWAY_ACKNOWLEDGE_EPHEMERAL is deprecated; set [persistence].acknowledgeEphemeral in config.toml",
+      { acknowledgeEphemeral: out.acknowledgeEphemeral }
+    );
+  }
+
+  return out;
+}
+
+function expandHome(p: string): string {
+  return p.startsWith("~/") ? path.join(os.homedir(), p.slice(2)) : p;
+}
+
+/**
+ * Load and validate the persistence config from (in order, last-write-wins):
+ *   1. Built-in defaults (backend=sqlite, default retention/dedup).
+ *   2. ~/.llm-cli-gateway/config.toml (or $LLM_GATEWAY_CONFIG).
+ *   3. Legacy env vars (with deprecation warning).
+ *
+ * Throws on incoherent configs (memory/none + asyncJobsEnabled without ack).
+ */
+export function loadPersistenceConfig(logger: Logger = noopLogger): PersistenceConfig {
+  const configPath = defaultPersistenceConfigPath();
+  const { raw, sourcePath } = readPersistenceFile(configPath, logger);
+  const sources: PersistenceConfigSources = {
+    configFile: sourcePath,
+    envOverrides: [],
+  };
+
+  const rawPersistence = (raw as Record<string, unknown> | undefined) ?? {};
+  const base = { ...rawPersistence };
+  const legacyDatabaseUrl = process.env.DATABASE_URL?.trim();
+  const legacyFileSelector =
+    Boolean(process.env.LLM_GATEWAY_JOBS_DB?.trim()) ||
+    Boolean(process.env.LLM_GATEWAY_LOGS_DB?.trim());
+  const explicitEngineSelection = ["backend", "dsn", "path", "roles"].some(key =>
+    Object.hasOwn(rawPersistence, key)
+  );
+  if (!explicitEngineSelection && legacyDatabaseUrl && !legacyFileSelector) {
+    // Backward compatibility without the old split: DATABASE_URL used to move
+    // sessions alone. When it is the only selector, treat it as a deprecated
+    // alias for the PostgreSQL backend so jobs and request history follow too.
+    base.backend = "postgres";
+    base.dsn = legacyDatabaseUrl;
+    sources.envOverrides.push("DATABASE_URL");
+  }
+
+  const merged = applyEnvOverrides(base, logger, sources);
+
+  // Issue #139: one-time deprecation warning when the interim gate is set. The
+  // durable lease supersedes it; the value is parsed but no longer load-bearing.
+  if (merged.ownsOrphanRecovery !== undefined) {
+    logWarn(
+      logger,
+      "[persistence].ownsOrphanRecovery is deprecated and no longer used; the durable per-job lease recovery (#139) runs safely from every instance. Remove it from config.toml."
+    );
+  }
+
+  // Refused BEFORE the schema, so the two keys that look reasonable and are not
+  // get an answer instead of "unrecognized key(s)".
+  const rawRoles = merged.roles;
+  if (rawRoles && typeof rawRoles === "object") {
+    for (const [key, why] of Object.entries(REFUSED_ROLE_KEYS)) {
+      if (Object.hasOwn(rawRoles as Record<string, unknown>, key)) {
+        throw new Error(`Invalid [persistence.roles] config: ${key} is not accepted here; ${why}`);
+      }
+    }
+  }
+
+  let parsed;
+  try {
+    parsed = PersistenceSchema.parse(merged);
+  } catch (err) {
+    throw new Error(
+      `Invalid [persistence] config: ${err instanceof Error ? err.message : String(err)}`,
+      { cause: err }
+    );
+  }
+
+  const backend = parsed.backend;
+  const resolvedPath = backend === "sqlite" ? expandHome(parsed.path ?? DEFAULT_SQLITE_PATH) : null;
+  const dsn = backend === "postgres" ? (parsed.dsn ?? null) : null;
+
+  if (backend !== "postgres" && parsed.dsn !== undefined) {
+    throw new Error(
+      `[persistence].dsn requires backend = "postgres"; this config selects backend = "${backend}".`
+    );
+  }
+  if (backend === "postgres" && !dsn) {
+    throw new Error(
+      "[persistence].backend = 'postgres' requires a non-empty 'dsn' (e.g. postgresql://user:pw@host/db)"
+    );
+  }
+
+  // A credential set that can never take effect is worse than none: it reads as
+  // role separation being in force on a deployment where there is one database
+  // identity, or one file. Refused rather than ignored.
+  const configuredRoles = parsed.roles ?? {};
+  const namedRoles = Object.entries(configuredRoles).filter(([, value]) => Boolean(value));
+  if (namedRoles.length > 0 && backend !== "postgres") {
+    throw new Error(
+      `[persistence.roles] is only meaningful with backend = "postgres"; this config has ` +
+        `backend = "${backend}", which has no per-role credentials. Remove the table or set the backend.`
+    );
+  }
+  const roleDsns: StorageRoleDsns =
+    backend === "postgres" && dsn
+      ? { ...(Object.fromEntries(namedRoles) as StorageRoleDsns), app: dsn }
+      : {};
+
+  if (backend === "memory" && !parsed.acknowledgeEphemeral) {
+    throw new Error(
+      "[persistence].backend = 'memory' is ephemeral — async job results are lost on gateway exit. " +
+        "Set [persistence].acknowledgeEphemeral = true (or LLM_GATEWAY_ACKNOWLEDGE_EPHEMERAL=1) to confirm this is intentional."
+    );
+  }
+
+  const asyncJobsEnabled = backend === "sqlite" || backend === "postgres" || backend === "memory";
+
+  if (backend === "none") {
+    logWarn(
+      logger,
+      "Async job persistence is DISABLED (backend = 'none'). " +
+        "*_request_async tools will NOT be registered on this gateway."
+    );
+  }
+
+  return {
+    backend,
+    path: resolvedPath,
+    dsn,
+    roleDsns,
+    retentionDays: parsed.retentionDays,
+    retention: resolveRetentionPolicy({
+      jobRetentionDays: parsed.retentionDays,
+      overrides: {
+        ...(parsed.retention.jobs !== undefined ? { jobs: parsed.retention.jobs } : {}),
+        ...(parsed.retention.requests !== undefined ? { requests: parsed.retention.requests } : {}),
+        ...(parsed.retention.wedgedValidationRuns !== undefined
+          ? { wedgedValidationRuns: parsed.retention.wedgedValidationRuns }
+          : {}),
+      },
+    }),
+    retentionSweepIntervalMs: parsed.retention.sweepIntervalMs,
+    dedupWindowMs: parsed.dedupWindowMs,
+    acknowledgeEphemeral: parsed.acknowledgeEphemeral,
+    ownsOrphanRecovery: parsed.ownsOrphanRecovery,
+    instanceHeartbeatMs: parsed.instanceHeartbeatMs,
+    instanceLeaseTtlMs: parsed.instanceLeaseTtlMs,
+    httpJobGraceMs: parsed.httpJobGraceMs,
+    orphanSweepIntervalMs: parsed.orphanSweepIntervalMs,
+    instanceGcMs: parsed.instanceGcMs,
+    asyncJobsEnabled,
+    sources,
+    // Read from the FILE, not from `merged`: legacy environment variables can
+    // synthesise a backend. A path, DSN, or roles table also makes the engine
+    // choice explicit enough that DATABASE_URL must not redirect sessions.
+    explicitBackend: explicitEngineSelection,
+  };
+}
+
+//──────────────────────────────────────────────────────────────────────────────
+// Host-protection limits (issue #130)
+//
+// Reads the [http] (session lifecycle) and [limits] (async/sync job execution
+// backpressure) tables from the same ~/.llm-cli-gateway/config.toml file, using
+// a SEPARATE loader/schema so a malformed limits block never breaks persistence
+// loading and vice versa. Defaults are conservative but chosen NOT to surprise
+// local stdio development: they only bite genuinely pathological session/job
+// growth. [http] is read with passthrough() because that table also carries the
+// [http.oauth] sub-table owned by loadRemoteOAuthConfig; we own only the three
+// session-lifecycle scalar keys here.
+//──────────────────────────────────────────────────────────────────────────────
+
+export const DEFAULT_HTTP_MAX_SESSIONS = 100;
+export const DEFAULT_HTTP_SESSION_IDLE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+export const DEFAULT_HTTP_SESSION_REAPER_INTERVAL_MS = 60 * 1000; // 1 minute
+
+export const DEFAULT_MAX_RUNNING_JOBS = 32;
+export const DEFAULT_MAX_RUNNING_JOBS_PER_PROVIDER = 16;
+export const DEFAULT_MAX_QUEUED_JOBS = 128;
+export const DEFAULT_QUEUE_TIMEOUT_MS = 120000; // 2 minutes
+export const DEFAULT_COMPLETED_JOB_MEMORY_TTL_MS = 60 * 60 * 1000; // 1 hour (durable store keeps its own, longer, retention)
+export const DEFAULT_MAX_JOB_OUTPUT_BYTES = 50 * 1024 * 1024; // 50MB
+
+// [http] carries the [http.oauth] sub-table (owned by loadRemoteOAuthConfig) plus
+// possibly other keys, so tolerate unknown keys via passthrough(). Only the three
+// session-lifecycle scalars below are owned/validated here.
+const HttpSessionLimitsSchema = z
+  .object({
+    max_sessions: z.number().int().positive().default(DEFAULT_HTTP_MAX_SESSIONS),
+    session_idle_ttl_ms: z.number().int().positive().default(DEFAULT_HTTP_SESSION_IDLE_TTL_MS),
+    session_reaper_interval_ms: z
+      .number()
+      .int()
+      .positive()
+      .default(DEFAULT_HTTP_SESSION_REAPER_INTERVAL_MS),
+  })
+  .passthrough();
+
+// [limits] is fully owned here, so it is strict: a typo'd key is a hard error
+// rather than a silently-ignored misconfiguration.
+const JobLimitsSchema = z
+  .object({
+    max_running_jobs: z.number().int().positive().default(DEFAULT_MAX_RUNNING_JOBS),
+    max_running_jobs_per_provider: z
+      .number()
+      .int()
+      .positive()
+      .default(DEFAULT_MAX_RUNNING_JOBS_PER_PROVIDER),
+    max_queued_jobs: z.number().int().positive().default(DEFAULT_MAX_QUEUED_JOBS),
+    queue_timeout_ms: z.number().int().positive().default(DEFAULT_QUEUE_TIMEOUT_MS),
+    completed_job_memory_ttl_ms: z
+      .number()
+      .int()
+      .positive()
+      .default(DEFAULT_COMPLETED_JOB_MEMORY_TTL_MS),
+    max_job_output_bytes: z.number().int().positive().default(DEFAULT_MAX_JOB_OUTPUT_BYTES),
+  })
+  .strict();
+
+export interface HttpSessionLimitsConfig {
+  maxSessions: number;
+  sessionIdleTtlMs: number;
+  sessionReaperIntervalMs: number;
+}
+
+export interface JobLimitsConfig {
+  maxRunningJobs: number;
+  maxRunningJobsPerProvider: number;
+  maxQueuedJobs: number;
+  queueTimeoutMs: number;
+  completedJobMemoryTtlMs: number;
+  maxJobOutputBytes: number;
+}
+
+export interface GatewayLimitsConfig {
+  http: HttpSessionLimitsConfig;
+  jobs: JobLimitsConfig;
+  /** Audit trail: file the config was loaded from (or null if defaults). */
+  sources: { configFile: string | null };
+}
+
+export const DEFAULT_HTTP_SESSION_LIMITS: HttpSessionLimitsConfig = {
+  maxSessions: DEFAULT_HTTP_MAX_SESSIONS,
+  sessionIdleTtlMs: DEFAULT_HTTP_SESSION_IDLE_TTL_MS,
+  sessionReaperIntervalMs: DEFAULT_HTTP_SESSION_REAPER_INTERVAL_MS,
+};
+
+export const DEFAULT_JOB_LIMITS: JobLimitsConfig = {
+  maxRunningJobs: DEFAULT_MAX_RUNNING_JOBS,
+  maxRunningJobsPerProvider: DEFAULT_MAX_RUNNING_JOBS_PER_PROVIDER,
+  maxQueuedJobs: DEFAULT_MAX_QUEUED_JOBS,
+  queueTimeoutMs: DEFAULT_QUEUE_TIMEOUT_MS,
+  completedJobMemoryTtlMs: DEFAULT_COMPLETED_JOB_MEMORY_TTL_MS,
+  maxJobOutputBytes: DEFAULT_MAX_JOB_OUTPUT_BYTES,
+};
+
+/**
+ * Load [http] session-lifecycle limits and [limits] job-execution backpressure
+ * from ~/.llm-cli-gateway/config.toml (override via $LLM_GATEWAY_CONFIG).
+ *
+ * Defaults apply when the tables/keys are absent. Syntax-invalid TOML keeps the
+ * whole-file fallback (defaults). Schema-invalid values (negative/zero/non-int)
+ * THROW a clear config error: a bad limit must not silently fall back to an
+ * unbounded or surprising value.
+ */
+export function loadLimitsConfig(logger: Logger = noopLogger): GatewayLimitsConfig {
+  const configPath = defaultGatewayConfigPath();
+  const { parsed, sourcePath } = readGatewayTomlFile(configPath, logger, "limits");
+  const rawHttp = (parsed?.http as Record<string, unknown> | undefined) ?? {};
+  const rawLimits = (parsed?.limits as Record<string, unknown> | undefined) ?? {};
+
+  let httpParsed;
+  try {
+    httpParsed = HttpSessionLimitsSchema.parse(rawHttp);
+  } catch (err) {
+    throw new Error(
+      `Invalid [http] session-limit config: ${err instanceof Error ? err.message : String(err)}`,
+      { cause: err }
+    );
+  }
+
+  let limitsParsed;
+  try {
+    limitsParsed = JobLimitsSchema.parse(rawLimits);
+  } catch (err) {
+    throw new Error(
+      `Invalid [limits] config: ${err instanceof Error ? err.message : String(err)}`,
+      {
+        cause: err,
+      }
+    );
+  }
+
+  return {
+    http: {
+      maxSessions: httpParsed.max_sessions,
+      sessionIdleTtlMs: httpParsed.session_idle_ttl_ms,
+      sessionReaperIntervalMs: httpParsed.session_reaper_interval_ms,
+    },
+    jobs: {
+      maxRunningJobs: limitsParsed.max_running_jobs,
+      maxRunningJobsPerProvider: limitsParsed.max_running_jobs_per_provider,
+      maxQueuedJobs: limitsParsed.max_queued_jobs,
+      queueTimeoutMs: limitsParsed.queue_timeout_ms,
+      completedJobMemoryTtlMs: limitsParsed.completed_job_memory_ttl_ms,
+      maxJobOutputBytes: limitsParsed.max_job_output_bytes,
+    },
+    sources: { configFile: sourcePath },
+  };
+}
+
+//──────────────────────────────────────────────────────────────────────────────
+// Cache-awareness configuration
+//
+// Reads the [cache_awareness] block from the same ~/.llm-cli-gateway/config.toml
+// file as [persistence], but uses a SEPARATE loader and schema. Keeping the two
+// independent means a malformed [cache_awareness] never breaks persistence
+// loading and vice versa. No env-var overrides — purely TOML.
+//
+// All defaults are "off"; behavioural changes (slice 1 cache_control, slice 3
+// TTL warnings) ship dormant until operators opt in.
+//──────────────────────────────────────────────────────────────────────────────
+
+export const ANTHROPIC_TTL_SECONDS_VALUES = [300, 3600] as const;
+export type AnthropicTtlSeconds = (typeof ANTHROPIC_TTL_SECONDS_VALUES)[number];
+
+/**
+ * Per-Anthropic-model-family minimum cacheable tokens. Sourced from
+ * docs/personal-mcp/PROVIDER_CACHE_SURFACES.md (Anthropic API docs as of
+ * 2026-05-26). Models below the threshold cannot be cached even with
+ * cache_control set — Anthropic silently returns un-cached.
+ */
+export const DEFAULT_MIN_STABLE_TOKENS_FOR_CACHE_CONTROL = {
+  sonnet: 1024,
+  opus: 4096,
+  haiku: 4096,
+  default: 4096,
+} as const;
+
+export type ModelFamilyAlias = keyof typeof DEFAULT_MIN_STABLE_TOKENS_FOR_CACHE_CONTROL;
+
+const MinStableTokensSchema = z
+  .object({
+    sonnet: z.number().int().positive().default(DEFAULT_MIN_STABLE_TOKENS_FOR_CACHE_CONTROL.sonnet),
+    opus: z.number().int().positive().default(DEFAULT_MIN_STABLE_TOKENS_FOR_CACHE_CONTROL.opus),
+    haiku: z.number().int().positive().default(DEFAULT_MIN_STABLE_TOKENS_FOR_CACHE_CONTROL.haiku),
+    default: z
+      .number()
+      .int()
+      .positive()
+      .default(DEFAULT_MIN_STABLE_TOKENS_FOR_CACHE_CONTROL.default),
+  })
+  .strict()
+  .default({
+    sonnet: DEFAULT_MIN_STABLE_TOKENS_FOR_CACHE_CONTROL.sonnet,
+    opus: DEFAULT_MIN_STABLE_TOKENS_FOR_CACHE_CONTROL.opus,
+    haiku: DEFAULT_MIN_STABLE_TOKENS_FOR_CACHE_CONTROL.haiku,
+    default: DEFAULT_MIN_STABLE_TOKENS_FOR_CACHE_CONTROL.default,
+  });
+
+const CacheAwarenessSchema = z
+  .object({
+    emit_anthropic_cache_control: z.boolean().default(false),
+    anthropic_ttl_seconds: z.union([z.literal(300), z.literal(3600)]).default(300),
+    warn_on_ttl_expiry: z.boolean().default(false),
+    min_stable_tokens_for_cache_control: MinStableTokensSchema,
+  })
+  .strict();
+
+export interface CacheAwarenessConfig {
+  emitAnthropicCacheControl: boolean;
+  anthropicTtlSeconds: AnthropicTtlSeconds;
+  warnOnTtlExpiry: boolean;
+  minStableTokensForCacheControl: {
+    sonnet: number;
+    opus: number;
+    haiku: number;
+    default: number;
+  };
+  /** Audit trail: file the config was loaded from (or null if defaults). */
+  sources: { configFile: string | null };
+}
+
+function readCacheAwarenessFile(
+  configPath: string,
+  logger: Logger
+): { raw: unknown; sourcePath: string | null } {
+  if (!existsSync(configPath)) {
+    return { raw: undefined, sourcePath: null };
+  }
+  try {
+    const require = createRequire(import.meta.url);
+    const TOML = require("smol-toml");
+    const text = readFileSync(configPath, "utf-8");
+    const parsed = TOML.parse(text) as Record<string, unknown>;
+    return { raw: parsed?.cache_awareness, sourcePath: configPath };
+  } catch (err) {
+    logger.error(
+      `Failed to parse gateway config at ${configPath}; using cache_awareness defaults`,
+      err
+    );
+    return { raw: undefined, sourcePath: null };
+  }
+}
+
+/**
+ * Load [cache_awareness] from ~/.llm-cli-gateway/config.toml. Defaults: all
+ * behaviour off, per-model min-token thresholds from PROVIDER_CACHE_SURFACES.md.
+ */
+export function loadCacheAwarenessConfig(logger: Logger = noopLogger): CacheAwarenessConfig {
+  const configPath = defaultPersistenceConfigPath();
+  const { raw, sourcePath } = readCacheAwarenessFile(configPath, logger);
+
+  let parsed;
+  try {
+    parsed = CacheAwarenessSchema.parse((raw as Record<string, unknown> | undefined) ?? {});
+  } catch (err) {
+    throw new Error(
+      `Invalid [cache_awareness] config: ${err instanceof Error ? err.message : String(err)}`,
+      { cause: err }
+    );
+  }
+
+  return {
+    emitAnthropicCacheControl: parsed.emit_anthropic_cache_control,
+    anthropicTtlSeconds: parsed.anthropic_ttl_seconds as AnthropicTtlSeconds,
+    warnOnTtlExpiry: parsed.warn_on_ttl_expiry,
+    minStableTokensForCacheControl: {
+      sonnet: parsed.min_stable_tokens_for_cache_control.sonnet,
+      opus: parsed.min_stable_tokens_for_cache_control.opus,
+      haiku: parsed.min_stable_tokens_for_cache_control.haiku,
+      default: parsed.min_stable_tokens_for_cache_control.default,
+    },
+    sources: { configFile: sourcePath },
+  };
+}
+
+//──────────────────────────────────────────────────────────────────────────────
+// Compression configuration (native compressor PR-1)
+//
+// Reads the [compression] block from the same ~/.llm-cli-gateway/config.toml
+// as the other tables, with its own loader and schema so a malformed
+// [compression] never breaks persistence/limits loading and vice versa.
+// Default is OFF: no caller's returned text changes on upgrade; compression
+// turns on only by explicit opt-in ([compression].enabled or the per-request
+// compressResponse boolean, request wins). See
+// docs/plans/native-compressor.spec.md Section 7.
+//──────────────────────────────────────────────────────────────────────────────
+
+// [compression] is fully owned here, so it is strict: a typo'd key is a hard
+// error rather than a silently-ignored misconfiguration.
+const CompressionSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+  })
+  .strict();
+
+export interface CompressionConfig {
+  enabled: boolean;
+  /** Audit trail: file the config was loaded from (or null if defaults). */
+  sources: { configFile: string | null };
+}
+
+export const DEFAULT_COMPRESSION_CONFIG: CompressionConfig = {
+  enabled: false,
+  sources: { configFile: null },
+};
+
+/**
+ * Load [compression] from ~/.llm-cli-gateway/config.toml (override with
+ * $LLM_GATEWAY_CONFIG). Missing file/table means defaults (off).
+ * Syntax-invalid TOML falls back to defaults; schema-invalid values THROW.
+ */
+export function loadCompressionConfig(logger: Logger = noopLogger): CompressionConfig {
+  const configPath = defaultGatewayConfigPath();
+  const { parsed, sourcePath } = readGatewayTomlFile(configPath, logger, "compression");
+  const raw = (parsed?.compression as Record<string, unknown> | undefined) ?? {};
+
+  let parsedCompression;
+  try {
+    parsedCompression = CompressionSchema.parse(raw);
+  } catch (err) {
+    throw new Error(
+      `Invalid [compression] config: ${err instanceof Error ? err.message : String(err)}`,
+      { cause: err }
+    );
+  }
+
+  return {
+    enabled: parsedCompression.enabled,
+    sources: { configFile: sourcePath },
+  };
+}
+
+//──────────────────────────────────────────────────────────────────────────────
+// Least-cost-routing (LCR) configuration ([least_cost])
+//
+// Reads the [least_cost] block (plus [least_cost.tiers] / [least_cost.candidates]
+// sub-tables) from the same ~/.llm-cli-gateway/config.toml as the other tables,
+// with its own loader + schema so a malformed [least_cost] never breaks the
+// other config loaders. Mirrors [acp] dormancy: enabled=false by default, so the
+// route_request / route_request_async tools are NOT registered until an operator
+// opts in. Missing block => all-off defaults; syntactically-broken TOML =>
+// whole-file fallback to defaults; schema-invalid => THROW so a bad routing
+// config cannot silently ship a surprising default. See
+// docs/least-cost-routing-contract.md and docs/plans/least-cost-routing.dag.toml.
+//──────────────────────────────────────────────────────────────────────────────
+
+export const LEAST_COST_PRIORS_SCOPES = ["global", "principal", "off"] as const;
+export type LeastCostPriorsScope = (typeof LEAST_COST_PRIORS_SCOPES)[number];
+
+export const DEFAULT_LEAST_COST_MAX_COST_USD = 0.5;
+export const DEFAULT_LEAST_COST_EXPECTED_OUTPUT_TOKENS = 800;
+export const DEFAULT_LEAST_COST_BUDGET_SAFETY_FACTOR = 1.5;
+export const DEFAULT_LEAST_COST_MAX_REROUTES = 2;
+
+/**
+ * Shipped default capability tiers, keyed EXACTLY as the router's tier gate looks
+ * them up: `${provider}:${modelIdToFamily(model)}` (see checkTier in
+ * src/least-cost-router.ts and modelIdToFamily in src/pricing.ts). The family
+ * segment is the resolved pricing family (e.g. "claude-sonnet"), NOT the CLI
+ * brand. A default ships for every family the price table knows so no priced CLI
+ * model is silently untiered (contract decision 12, spec 4.4). Operators override
+ * per-key via [least_cost.tiers]; this is config data, not a provider registry
+ * (it spells no forbidden provider-name array; provider:surfaces:check is
+ * unaffected). economy: cheap/coding tiers; standard: mainline; frontier: top.
+ */
+export const DEFAULT_LEAST_COST_TIERS: Readonly<Record<string, QualityTier>> = {
+  "claude:claude-haiku": "economy",
+  "claude:claude-sonnet": "standard",
+  "claude:claude-opus": "frontier",
+  "codex:openai-gpt5": "standard",
+  "gemini:gemini-2.5-flash": "economy",
+  "gemini:gemini-2.5-pro": "standard",
+  "gemini:gemini-3-pro": "frontier",
+  "grok:grok-build": "economy",
+  "grok:grok-4": "standard",
+  // Grok 4.5 and later are frontier, not mainline: 4.5 is xAI's top model for
+  // coding, agentic work, and knowledge tasks, and it is priced above the
+  // grok-4.3 flagship. A later grok-4.x/5 release needs its own family and
+  // rate before it can be tiered; until then it resolves to no family and
+  // least-cost routing declines it rather than guessing.
+  "grok:grok-4.5": "frontier",
+  "mistral:mistral-devstral": "economy",
+  "mistral:mistral-medium": "standard",
+};
+
+const QualityTierSchema = z.enum(["economy", "standard", "frontier"]);
+
+// [least_cost.candidates] bounds the pool. Strict so a typo'd key is a hard error.
+const LeastCostCandidatesSchema = z
+  .object({
+    allow: z.array(z.string().min(1)).default([]),
+    deny: z.array(z.string().min(1)).default([]),
+  })
+  .strict()
+  .default({ allow: [], deny: [] });
+
+// [least_cost] is fully owned here, so it is strict: a typo'd key is a hard error
+// rather than a silently-ignored misconfiguration. The [least_cost.tiers] record
+// values are tier enums; the keys are arbitrary `provider:family` strings so the
+// record is permissive on keys but strict on values.
+const LeastCostSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    min_tier: QualityTierSchema.default("standard"),
+    max_cost_usd: z.number().positive().default(DEFAULT_LEAST_COST_MAX_COST_USD),
+    default_expected_output_tokens: z
+      .number()
+      .int()
+      .positive()
+      .default(DEFAULT_LEAST_COST_EXPECTED_OUTPUT_TOKENS),
+    budget_output_safety_factor: z
+      .number()
+      .positive()
+      .default(DEFAULT_LEAST_COST_BUDGET_SAFETY_FACTOR),
+    priors_scope: z.enum(LEAST_COST_PRIORS_SCOPES).default("global"),
+    allow_unpriced: z.boolean().default(false),
+    max_reroutes: z.number().int().nonnegative().default(DEFAULT_LEAST_COST_MAX_REROUTES),
+    prefer_catalog_price: z.boolean().default(true),
+    preference_order: z.array(z.string().min(1)).default([]),
+    tiers: z.record(z.string(), QualityTierSchema).default({}),
+    candidates: LeastCostCandidatesSchema,
+  })
+  .strict();
+
+export interface LeastCostConfig {
+  enabled: boolean;
+  minTier: QualityTier;
+  maxCostUsd: number;
+  defaultExpectedOutputTokens: number;
+  budgetOutputSafetyFactor: number;
+  priorsScope: LeastCostPriorsScope;
+  allowUnpriced: boolean;
+  maxReroutes: number;
+  preferCatalogPrice: boolean;
+  /** Provider preference order for tie-break (spec 4.5); missing providers rank last. */
+  preferenceOrder: string[];
+  /**
+   * Resolved tier map: DEFAULT_LEAST_COST_TIERS merged with any operator
+   * [least_cost.tiers] overrides (operator wins). Keyed `provider:family`.
+   */
+  tiers: Record<string, QualityTier>;
+  candidates: { allow: string[]; deny: string[] };
+  /** Audit trail: which inputs (file, env vars) contributed to the resolved config. */
+  sources: { configFile: string | null; envOverrides: string[] };
+}
+
+export function defaultLeastCostConfig(sourcePath: string | null = null): LeastCostConfig {
+  return {
+    enabled: false,
+    minTier: "standard",
+    maxCostUsd: DEFAULT_LEAST_COST_MAX_COST_USD,
+    defaultExpectedOutputTokens: DEFAULT_LEAST_COST_EXPECTED_OUTPUT_TOKENS,
+    budgetOutputSafetyFactor: DEFAULT_LEAST_COST_BUDGET_SAFETY_FACTOR,
+    priorsScope: "global",
+    allowUnpriced: false,
+    maxReroutes: DEFAULT_LEAST_COST_MAX_REROUTES,
+    preferCatalogPrice: true,
+    preferenceOrder: [],
+    tiers: { ...DEFAULT_LEAST_COST_TIERS },
+    candidates: { allow: [], deny: [] },
+    sources: { configFile: sourcePath, envOverrides: [] },
+  };
+}
+
+function readLeastCostFile(
+  configPath: string,
+  logger: Logger
+): { raw: unknown; sourcePath: string | null } {
+  if (!existsSync(configPath)) {
+    return { raw: undefined, sourcePath: null };
+  }
+  try {
+    const require = createRequire(import.meta.url);
+    const TOML = require("smol-toml");
+    const text = readFileSync(configPath, "utf-8");
+    const parsed = TOML.parse(text) as Record<string, unknown>;
+    return { raw: parsed?.least_cost, sourcePath: configPath };
+  } catch (err) {
+    logger.error(`Failed to parse gateway config at ${configPath}; using least_cost defaults`, err);
+    return { raw: undefined, sourcePath: null };
+  }
+}
+
+/**
+ * Load [least_cost] from ~/.llm-cli-gateway/config.toml (override via
+ * $LLM_GATEWAY_CONFIG).
+ *
+ * Defaults are fully dormant (enabled=false): the route tools stay unregistered
+ * until an operator opts in. A missing block OR syntactically-broken TOML falls
+ * back to all-off defaults. Schema-invalid [least_cost] config THROWS ("Invalid
+ * [least_cost] config: ...") so a malformed routing block (bad tier enum,
+ * negative budget, unknown key) cannot silently route with a surprising default.
+ *
+ * Env-override policy mirrors [acp]: routing is configured only through the TOML
+ * file. `enabled` can never be flipped on by an environment variable (that would
+ * weaken the dormant-by-default invariant). The single recognized env var
+ * `LLM_GATEWAY_LEAST_COST`, if set, is DEPRECATED / unsupported: it emits a
+ * one-time deprecation warning steering the operator to config.toml and is
+ * otherwise ignored.
+ */
+export function loadLeastCostConfig(logger: Logger = noopLogger): LeastCostConfig {
+  const configPath = defaultGatewayConfigPath();
+  const { raw, sourcePath } = readLeastCostFile(configPath, logger);
+  const envOverrides: string[] = [];
+
+  // Deprecated env sentinel: warn once and ignore. Never enables routing.
+  const envSentinel = process.env.LLM_GATEWAY_LEAST_COST;
+  if (envSentinel !== undefined && envSentinel.length > 0) {
+    envOverrides.push("LLM_GATEWAY_LEAST_COST");
+    logWarn(
+      logger,
+      "LLM_GATEWAY_LEAST_COST is not supported and is ignored; configure [least_cost] in " +
+        "~/.llm-cli-gateway/config.toml (routing cannot be enabled via an environment variable)."
+    );
+  }
+
+  if (raw === undefined) {
+    const cfg = defaultLeastCostConfig(sourcePath);
+    cfg.sources.envOverrides = envOverrides;
+    return cfg;
+  }
+
+  let parsed;
+  try {
+    parsed = LeastCostSchema.parse(raw);
+  } catch (err) {
+    throw new Error(
+      `Invalid [least_cost] config: ${err instanceof Error ? err.message : String(err)}`,
+      { cause: err }
+    );
+  }
+
+  // Operator tier overrides win over the shipped defaults; both share the same
+  // `provider:family` key space so an override replaces exactly one entry.
+  const tiers: Record<string, QualityTier> = { ...DEFAULT_LEAST_COST_TIERS, ...parsed.tiers };
+
+  return {
+    enabled: parsed.enabled,
+    minTier: parsed.min_tier,
+    maxCostUsd: parsed.max_cost_usd,
+    defaultExpectedOutputTokens: parsed.default_expected_output_tokens,
+    budgetOutputSafetyFactor: parsed.budget_output_safety_factor,
+    priorsScope: parsed.priors_scope,
+    allowUnpriced: parsed.allow_unpriced,
+    maxReroutes: parsed.max_reroutes,
+    preferCatalogPrice: parsed.prefer_catalog_price,
+    preferenceOrder: [...parsed.preference_order],
+    tiers,
+    candidates: {
+      allow: [...parsed.candidates.allow],
+      deny: [...parsed.candidates.deny],
+    },
+    sources: { configFile: sourcePath, envOverrides },
+  };
+}
+
+/**
+ * Look up the per-model-family threshold. `modelName` is the user-facing model
+ * string (e.g. "claude-sonnet-4-6", "claude-opus-4-7"). Falls back to `default`
+ * when the family is unrecognised.
+ */
+export function minStableTokensForModel(config: CacheAwarenessConfig, modelName: string): number {
+  const lower = modelName.toLowerCase();
+  const table = config.minStableTokensForCacheControl;
+  if (lower.includes("sonnet")) return table.sonnet;
+  if (lower.includes("opus")) return table.opus;
+  if (lower.includes("haiku")) return table.haiku;
+  return table.default;
+}
+
+//──────────────────────────────────────────────────────────────────────────────
+// Outbound API provider configuration
+//
+// Reads [providers.xai] independently from persistence/cache_awareness. The
+// resolved config never contains provider secret material; it carries only the
+// environment-variable name to read at request time. Schema-invalid provider
+// config disables only that provider and emits a warning. Syntax-invalid TOML
+// keeps the existing whole-file fallback behaviour and returns defaults.
+//──────────────────────────────────────────────────────────────────────────────
+
+// Spawnable CLI provider names reserved against API-provider name collisions.
+const RESERVED_CLI_PROVIDER_NAMES: readonly string[] = CLI_TYPES;
+
+export const DEFAULT_XAI_API_KEY_ENV = "XAI_API_KEY";
+export const DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1";
+export const DEFAULT_XAI_MODEL = "grok-build-0.1";
+
+const XaiProviderSchema = z
+  .object({
+    api_key_env: z.string().min(1).default(DEFAULT_XAI_API_KEY_ENV),
+    base_url: z
+      .string()
+      .url()
+      .refine(isHttpsOrLoopbackUrl, {
+        message: "base_url must use https unless it targets localhost/loopback for tests",
+      })
+      .default(DEFAULT_XAI_BASE_URL),
+    default_model: z.string().min(1).default(DEFAULT_XAI_MODEL),
+  })
+  .strict();
+
+export interface XaiProviderConfig {
+  apiKeyEnv: string;
+  baseUrl: string;
+  defaultModel: string;
+}
+
+// Slice 0: generic `[providers.<name>]` config. `kind` selects the adapter; a
+// missing `api_key_env` is allowed only for keyless-local providers (see
+// isApiProviderEnabled). Strict so typos surface as a disabled-provider warning
+// rather than being silently ignored.
+const ApiProviderSchema = z
+  .object({
+    kind: z.enum(["openai-compatible", "anthropic", "xai-responses"]),
+    base_url: z.string().url().refine(isHttpsOrLoopbackUrl, {
+      message: "base_url must use https unless it targets localhost/loopback",
+    }),
+    api_key_env: z.string().min(1).optional(),
+    default_model: z.string().min(1),
+    models: z.array(z.string().min(1)).nonempty().optional(),
+    // Slice 1 (telemetry parity): opt the openai-compatible adapter into the
+    // OpenRouter `usage: { include: true }` body flag so token/cost usage is
+    // returned in the response. Capability-typed (not name-branched) so strict
+    // OpenAI-compatible servers that reject the field stay unaffected by default.
+    usage_include: z.boolean().optional(),
+  })
+  .strict();
+
+export interface ApiProviderConfig {
+  name: string;
+  kind: ApiProviderKind;
+  /** Env var name to read the key from at request time; null = keyless-local. */
+  apiKeyEnv: string | null;
+  baseUrl: string;
+  defaultModel: string;
+  /** Optional model allowlist; undefined = no restriction. */
+  models?: string[];
+  /** Slice 1: emit `usage:{include:true}` (OpenRouter token/cost reporting). */
+  usageInclude?: boolean;
+}
+
+/** An enabled provider with its API key resolved from the environment. */
+export interface ApiProviderRuntime {
+  name: string;
+  kind: ApiProviderKind;
+  /** Env var name to read the key from at request time; null = keyless-local. */
+  apiKeyEnv: string | null;
+  baseUrl: string;
+  defaultModel: string;
+  models?: string[];
+  /** Slice 1: emit `usage:{include:true}` (OpenRouter token/cost reporting). */
+  usageInclude?: boolean;
+  /** Resolved key — empty string for a keyless-local provider. */
+  apiKey: string;
+}
+
+export interface ProvidersConfig {
+  /** Back-compat: the xAI provider, also present in `providers["xai"]`. */
+  xai: XaiProviderConfig | null;
+  /** All configured API providers keyed by config name (incl. xai). */
+  providers: Record<string, ApiProviderConfig>;
+  sources: { configFile: string | null };
+}
+
+function readProvidersFile(
+  configPath: string,
+  logger: Logger
+): { raw: unknown; sourcePath: string | null } {
+  if (!existsSync(configPath)) {
+    return { raw: undefined, sourcePath: null };
+  }
+  try {
+    const require = createRequire(import.meta.url);
+    const TOML = require("smol-toml");
+    const text = readFileSync(configPath, "utf-8");
+    const parsed = TOML.parse(text) as Record<string, unknown>;
+    return { raw: parsed?.providers, sourcePath: configPath };
+  } catch (err) {
+    logger.error(`Failed to parse gateway config at ${configPath}; using provider defaults`, err);
+    return { raw: undefined, sourcePath: null };
+  }
+}
+
+export function loadProvidersConfig(logger: Logger = noopLogger): ProvidersConfig {
+  const configPath = defaultGatewayConfigPath();
+  const { raw, sourcePath } = readProvidersFile(configPath, logger);
+  const rawProviders = (raw as Record<string, unknown> | undefined) ?? {};
+  const providers: Record<string, ApiProviderConfig> = {};
+
+  // xAI keeps its dedicated schema (defaults + no required `kind`) so existing
+  // `[providers.xai]` configs continue to load unchanged.
+  let xai: XaiProviderConfig | null = null;
+  const rawXai = rawProviders.xai;
+  if (rawXai !== undefined) {
+    const parsed = XaiProviderSchema.safeParse(rawXai);
+    if (parsed.success) {
+      xai = {
+        apiKeyEnv: parsed.data.api_key_env,
+        baseUrl: parsed.data.base_url,
+        defaultModel: parsed.data.default_model,
+      };
+      providers.xai = {
+        name: "xai",
+        kind: "xai-responses",
+        apiKeyEnv: parsed.data.api_key_env,
+        baseUrl: parsed.data.base_url,
+        defaultModel: parsed.data.default_model,
+      };
+    } else {
+      logWarn(logger, "Invalid [providers.xai] config; xAI API provider disabled", {
+        error: parsed.error.message,
+      });
+    }
+  }
+
+  // Every other `[providers.<name>]` entry parses with the generic schema.
+  // Failure isolation: a malformed single provider disables only itself (warn),
+  // never the whole map, never persistence.
+  for (const [name, rawProvider] of Object.entries(rawProviders)) {
+    if (name === "xai") continue;
+    // An API provider MUST NOT be named after a spawnable CLI. Otherwise it would
+    // shadow that CLI on the validation reviewer path (matched by name) and
+    // confuse metrics/catalogs. Reject the collision with a warning rather than
+    // silently letting an HTTP endpoint impersonate `claude`/`codex`/etc.
+    if (RESERVED_CLI_PROVIDER_NAMES.includes(name)) {
+      logWarn(
+        logger,
+        `[providers.${name}] is rejected: "${name}" is a reserved CLI provider name and cannot be used for an API provider`
+      );
+      continue;
+    }
+    const parsed = ApiProviderSchema.safeParse(rawProvider);
+    if (!parsed.success) {
+      logWarn(logger, `Invalid [providers.${name}] config; API provider disabled`, {
+        error: parsed.error.message,
+      });
+      continue;
+    }
+    providers[name] = {
+      name,
+      kind: parsed.data.kind,
+      apiKeyEnv: parsed.data.api_key_env ?? null,
+      baseUrl: parsed.data.base_url,
+      defaultModel: parsed.data.default_model,
+      models: parsed.data.models ? [...parsed.data.models] : undefined,
+      usageInclude: parsed.data.usage_include,
+    };
+  }
+
+  return { xai, providers, sources: { configFile: sourcePath } };
+}
+
+/**
+ * Resolve a provider's API key from the environment, or `null` when it is not
+ * set. Empty/whitespace-only values count as unset.
+ */
+function resolveProviderKey(apiKeyEnv: string | null, env: NodeJS.ProcessEnv): string | null {
+  if (!apiKeyEnv) return null;
+  const value = env[apiKeyEnv];
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+/**
+ * A provider is enabled when its key is present, OR — the keyless-local
+ * exception — it is an `openai-compatible` provider on a loopback `base_url`
+ * (Ollama/llama.cpp need no key). Everything else with an empty key is disabled.
+ */
+export function isApiProviderEnabled(
+  provider: ApiProviderConfig,
+  env: NodeJS.ProcessEnv = process.env
+): boolean {
+  if (resolveProviderKey(provider.apiKeyEnv, env) !== null) return true;
+  return provider.kind === "openai-compatible" && isLoopbackUrl(provider.baseUrl);
+}
+
+/**
+ * Slice 6: whether a provider's API key is resolvable from the environment,
+ * reported by doctor / provider-status / login-guidance without exposing the
+ * value. A keyless-local provider (apiKeyEnv null) reports `false` here even
+ * though it is still enabled (see the loopback exception in
+ * `isApiProviderEnabled`).
+ */
+export function apiProviderKeyPresent(
+  provider: ApiProviderConfig,
+  env: NodeJS.ProcessEnv = process.env
+): boolean {
+  return resolveProviderKey(provider.apiKeyEnv, env) !== null;
+}
+
+/** The enabled API providers with keys resolved (empty string for keyless). */
+export function enabledApiProviders(
+  config: ProvidersConfig,
+  env: NodeJS.ProcessEnv = process.env
+): ApiProviderRuntime[] {
+  const runtimes: ApiProviderRuntime[] = [];
+  // Defensive: tolerate a ProvidersConfig built before the `providers` map
+  // existed (older callers / test mocks pass only { xai, sources }).
+  for (const provider of Object.values(config.providers ?? {})) {
+    if (!isApiProviderEnabled(provider, env)) continue;
+    runtimes.push({
+      name: provider.name,
+      kind: provider.kind,
+      apiKeyEnv: provider.apiKeyEnv,
+      baseUrl: provider.baseUrl,
+      defaultModel: provider.defaultModel,
+      models: provider.models,
+      usageInclude: provider.usageInclude,
+      apiKey: resolveProviderKey(provider.apiKeyEnv, env) ?? "",
+    });
+  }
+  return runtimes;
+}
+
+export function isXaiProviderEnabled(
+  config: ProvidersConfig,
+  env: NodeJS.ProcessEnv = process.env
+): boolean {
+  const keyEnv = config.xai?.apiKeyEnv;
+  if (!keyEnv) return false;
+  return typeof env[keyEnv] === "string" && env[keyEnv]!.trim().length > 0;
+}
+
+//──────────────────────────────────────────────────────────────────────────────
+// ACP (Agent Client Protocol) transport configuration
+//
+// Reads the [acp] block (and [acp.providers.<name>] sub-tables) from the same
+// ~/.llm-cli-gateway/config.toml file as [persistence]/[cache_awareness], but
+// uses a SEPARATE loader and schema so a malformed [acp] block never breaks
+// other config loaders. All behaviour ships dormant: enabled=false, every
+// provider runtime gate off, write/terminal host services off, and
+// default_transport stays "cli" so existing CLI request paths are unchanged.
+//
+// SECURITY: provider entrypoints are stored as an executable plus an argv array
+// only. Shell-style command strings (anything that requires shell parsing —
+// spaces, pipes, redirects, command substitution, globbing, etc.) are rejected
+// at validation time so the gateway can spawn without a shell. No secret
+// material is ever stored here.
+//──────────────────────────────────────────────────────────────────────────────
+
+export const ACP_TRANSPORTS = ["cli", "acp"] as const;
+export type AcpTransport = (typeof ACP_TRANSPORTS)[number];
+
+export const DEFAULT_ACP_PROCESS_IDLE_TIMEOUT_MS = 600000; // 10 minutes
+export const DEFAULT_ACP_INITIALIZE_TIMEOUT_MS = 10000;
+export const DEFAULT_ACP_SESSION_NEW_TIMEOUT_MS = 10000;
+export const DEFAULT_ACP_PROMPT_TIMEOUT_MS = 600000; // 10 minutes
+
+/**
+ * Characters that imply a string must be interpreted by a shell rather than
+ * spawned directly as an executable. Their presence in a `command` is a hard
+ * validation error — entrypoints are never passed through a shell.
+ */
+// eslint-disable-next-line no-control-regex
+const SHELL_METACHARACTERS = /[\s|&;<>(){}$`"'\\*?[\]~#!\0]/;
+
+function isSafeExecutable(value: string): boolean {
+  if (value.length === 0) return false;
+  return !SHELL_METACHARACTERS.test(value);
+}
+
+const SafeExecutableSchema = z
+  .string()
+  .min(1)
+  .refine(isSafeExecutable, {
+    message:
+      "ACP provider command must be a bare executable name or path with no shell metacharacters " +
+      "(no spaces, quotes, pipes, redirects, globs, or command substitution); pass arguments via 'args'",
+  });
+
+const SafeArgSchema = z.string();
+
+const AcpProviderSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    command: SafeExecutableSchema,
+    args: z.array(SafeArgSchema).default([]),
+    runtime_enabled: z.boolean().default(false),
+    isolated_leader_socket: z.boolean().default(false),
+  })
+  .strict();
+
+const AcpConfigSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    default_transport: z.enum(ACP_TRANSPORTS).default("cli"),
+    smoke_on_startup: z.boolean().default(false),
+    process_idle_timeout_ms: z
+      .number()
+      .int()
+      .positive()
+      .default(DEFAULT_ACP_PROCESS_IDLE_TIMEOUT_MS),
+    initialize_timeout_ms: z.number().int().positive().default(DEFAULT_ACP_INITIALIZE_TIMEOUT_MS),
+    session_new_timeout_ms: z.number().int().positive().default(DEFAULT_ACP_SESSION_NEW_TIMEOUT_MS),
+    prompt_timeout_ms: z.number().int().positive().default(DEFAULT_ACP_PROMPT_TIMEOUT_MS),
+    allow_write_host_services: z.boolean().default(false),
+    allow_terminal_host_services: z.boolean().default(false),
+    allow_mutating_session_ops: z.boolean().default(false),
+    fallback_to_cli_when_unhealthy: z.boolean().default(true),
+    providers: z.record(z.string(), AcpProviderSchema).default({}),
+  })
+  .strict();
+
+export interface AcpProviderConfig {
+  enabled: boolean;
+  command: string;
+  args: string[];
+  runtimeEnabled: boolean;
+  isolatedLeaderSocket: boolean;
+}
+
+export interface AcpConfig {
+  enabled: boolean;
+  defaultTransport: AcpTransport;
+  smokeOnStartup: boolean;
+  processIdleTimeoutMs: number;
+  initializeTimeoutMs: number;
+  sessionNewTimeoutMs: number;
+  promptTimeoutMs: number;
+  allowWriteHostServices: boolean;
+  allowTerminalHostServices: boolean;
+  /**
+   * Whether state-mutating ACP admin ops (`session/delete`, `session/set_mode`,
+   * `session/set_config_option`) may be invoked. Deny-by-default.
+   */
+  allowMutatingSessionOps: boolean;
+  fallbackToCliWhenUnhealthy: boolean;
+  providers: Record<string, AcpProviderConfig>;
+  /** Audit trail: file the config was loaded from (or null if defaults). */
+  sources: { configFile: string | null };
+}
+
+function defaultAcpConfig(sourcePath: string | null): AcpConfig {
+  return {
+    enabled: false,
+    defaultTransport: "cli",
+    smokeOnStartup: false,
+    processIdleTimeoutMs: DEFAULT_ACP_PROCESS_IDLE_TIMEOUT_MS,
+    initializeTimeoutMs: DEFAULT_ACP_INITIALIZE_TIMEOUT_MS,
+    sessionNewTimeoutMs: DEFAULT_ACP_SESSION_NEW_TIMEOUT_MS,
+    promptTimeoutMs: DEFAULT_ACP_PROMPT_TIMEOUT_MS,
+    allowWriteHostServices: false,
+    allowTerminalHostServices: false,
+    allowMutatingSessionOps: false,
+    fallbackToCliWhenUnhealthy: true,
+    providers: {},
+    sources: { configFile: sourcePath },
+  };
+}
+
+function readAcpFile(
+  configPath: string,
+  logger: Logger
+): { raw: unknown; sourcePath: string | null } {
+  if (!existsSync(configPath)) {
+    return { raw: undefined, sourcePath: null };
+  }
+  try {
+    const require = createRequire(import.meta.url);
+    const TOML = require("smol-toml");
+    const text = readFileSync(configPath, "utf-8");
+    const parsed = TOML.parse(text) as Record<string, unknown>;
+    return { raw: parsed?.acp, sourcePath: configPath };
+  } catch (err) {
+    logger.error(`Failed to parse gateway config at ${configPath}; using acp defaults`, err);
+    return { raw: undefined, sourcePath: null };
+  }
+}
+
+/**
+ * Load [acp] from ~/.llm-cli-gateway/config.toml (override via $LLM_GATEWAY_CONFIG).
+ *
+ * Defaults are fully dormant: ACP disabled, default_transport "cli", every
+ * provider runtime gate off, write/terminal host services off. Syntax-invalid
+ * TOML keeps the whole-file fallback (defaults). Schema-invalid [acp] config
+ * THROWS — a malformed ACP block (e.g. a shell-style command, invalid transport,
+ * or non-positive timeout) is a hard error so misconfiguration cannot silently
+ * spawn the wrong process or run with the wrong gate.
+ */
+export function loadAcpConfig(logger: Logger = noopLogger): AcpConfig {
+  const configPath = defaultGatewayConfigPath();
+  const { raw, sourcePath } = readAcpFile(configPath, logger);
+
+  if (raw === undefined) {
+    return defaultAcpConfig(sourcePath);
+  }
+
+  let parsed;
+  try {
+    parsed = AcpConfigSchema.parse(raw);
+  } catch (err) {
+    throw new Error(`Invalid [acp] config: ${err instanceof Error ? err.message : String(err)}`, {
+      cause: err,
+    });
+  }
+
+  const providers: Record<string, AcpProviderConfig> = {};
+  for (const [name, p] of Object.entries(parsed.providers)) {
+    providers[name] = {
+      enabled: p.enabled,
+      command: p.command,
+      args: p.args,
+      runtimeEnabled: p.runtime_enabled,
+      isolatedLeaderSocket: p.isolated_leader_socket,
+    };
+  }
+
+  return {
+    enabled: parsed.enabled,
+    defaultTransport: parsed.default_transport,
+    smokeOnStartup: parsed.smoke_on_startup,
+    processIdleTimeoutMs: parsed.process_idle_timeout_ms,
+    initializeTimeoutMs: parsed.initialize_timeout_ms,
+    sessionNewTimeoutMs: parsed.session_new_timeout_ms,
+    promptTimeoutMs: parsed.prompt_timeout_ms,
+    allowWriteHostServices: parsed.allow_write_host_services,
+    allowTerminalHostServices: parsed.allow_terminal_host_services,
+    allowMutatingSessionOps: parsed.allow_mutating_session_ops,
+    fallbackToCliWhenUnhealthy: parsed.fallback_to_cli_when_unhealthy,
+    providers,
+    sources: { configFile: sourcePath },
+  };
+}
+
+//──────────────────────────────────────────────────────────────────────────────
+// CLI admin operations configuration ([admin])
+//
+// Gates the phase-6 provider-admin MUTATING surface (mcp add/remove, login/
+// logout, plugin install/remove, session delete/archive, ...). Deny-by-default,
+// parallel to acp.allow_mutating_session_ops: when false, a mutating admin tool
+// call fails closed WITHOUT spawning; when true it routes through the approval
+// manager and is audited. Read-only admin ops are unaffected by this gate.
+//──────────────────────────────────────────────────────────────────────────────
+
+const AdminConfigSchema = z
+  .object({
+    allow_mutating_cli_admin_ops: z.boolean().default(false),
+  })
+  .strict();
+
+export interface AdminConfig {
+  /** Whether mutating provider CLI admin ops may run. Deny-by-default. */
+  allowMutatingCliAdminOps: boolean;
+  /** Audit trail: file the config was loaded from (or null if defaults). */
+  sources: { configFile: string | null };
+}
+
+function defaultAdminConfig(sourcePath: string | null): AdminConfig {
+  return { allowMutatingCliAdminOps: false, sources: { configFile: sourcePath } };
+}
+
+function readAdminFile(
+  configPath: string,
+  logger: Logger
+): { raw: unknown; sourcePath: string | null } {
+  if (!existsSync(configPath)) {
+    return { raw: undefined, sourcePath: null };
+  }
+  try {
+    const require = createRequire(import.meta.url);
+    const TOML = require("smol-toml");
+    const text = readFileSync(configPath, "utf-8");
+    const parsed = TOML.parse(text) as Record<string, unknown>;
+    return { raw: parsed?.admin, sourcePath: configPath };
+  } catch (err) {
+    logger.error(`Failed to parse gateway config at ${configPath}; using admin defaults`, err);
+    return { raw: undefined, sourcePath: null };
+  }
+}
+
+/**
+ * Load [admin] from ~/.llm-cli-gateway/config.toml (override via $LLM_GATEWAY_CONFIG).
+ *
+ * Defaults are fully locked down (mutating CLI admin ops OFF). A syntax-invalid
+ * TOML keeps the whole-file fallback (defaults). A schema-invalid [admin] block
+ * THROWS so a misconfiguration cannot silently flip the mutating gate on.
+ */
+export function loadAdminConfig(logger: Logger = noopLogger): AdminConfig {
+  const configPath = defaultGatewayConfigPath();
+  const { raw, sourcePath } = readAdminFile(configPath, logger);
+  if (raw === undefined) {
+    return defaultAdminConfig(sourcePath);
+  }
+  let parsed;
+  try {
+    parsed = AdminConfigSchema.parse(raw);
+  } catch (err) {
+    throw new Error(`Invalid [admin] config: ${err instanceof Error ? err.message : String(err)}`, {
+      cause: err,
+    });
+  }
+  return {
+    allowMutatingCliAdminOps: parsed.allow_mutating_cli_admin_ops,
+    sources: { configFile: sourcePath },
+  };
+}
+
+//──────────────────────────────────────────────────────────────────────────────
+// Remote connector OAuth configuration
+//──────────────────────────────────────────────────────────────────────────────
+
+const OAuthRegistrationPolicySchema = z.enum(["static_clients", "shared_secret", "open_dev"]);
+
+const OAuthClientSchema = z
+  .object({
+    client_id: z.string().min(1),
+    client_secret_hash: z.string().optional(),
+    allowed_redirect_uris: z.array(z.string().url()).default([]),
+    scopes: z.array(z.string().min(1)).default(["mcp"]),
+  })
+  .strict();
+
+const OAuthSharedSecretSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    secret_hash: z.string().optional(),
+    prompt_label: z.string().min(1).default("Gateway access code"),
+  })
+  .strict();
+
+const OAuthConfigSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    issuer: z.string().min(1).default("auto"),
+    require_pkce: z.boolean().default(true),
+    allow_plain_pkce: z.boolean().default(false),
+    registration_policy: OAuthRegistrationPolicySchema.default("static_clients"),
+    allow_public_clients: z.boolean().default(false),
+    token_ttl_seconds: z.number().int().positive().default(3600),
+    // F14b: opt-in human-consent gate before /oauth/authorize issues a code.
+    require_consent: z.boolean().default(false),
+    consent_secret_hash: z.string().optional(),
+    clients: z.array(OAuthClientSchema).default([]),
+    shared_secret: OAuthSharedSecretSchema.optional(),
+  })
+  .strict();
+
+function disabledOAuthConfig(
+  sourcePath: string | null = null,
+  envOverrides: string[] = []
+): RemoteOAuthConfig {
+  return {
+    enabled: false,
+    issuer: "auto",
+    requirePkce: true,
+    allowPlainPkce: false,
+    registrationPolicy: "static_clients",
+    allowPublicClients: false,
+    tokenTtlSeconds: 3600,
+    requireConsent: false,
+    consentSecretHash: null,
+    clients: [],
+    sharedSecret: null,
+    sources: { configFile: sourcePath, envOverrides },
+  };
+}
+
+function isSafeRedirectUri(uri: string): boolean {
+  return isHttpsOrLoopbackUrl(uri);
+}
+
+/**
+ * Coarse status of the remote OAuth config, used by the doctor readiness
+ * projection to distinguish "operator has not enabled OAuth" from "operator
+ * enabled OAuth but the config is unsafe/malformed". `loadRemoteOAuthConfig`
+ * wraps this and returns only the resolved config for back-compat.
+ *
+ *   - "absent":    no [http.oauth] table and no OAuth env overrides.
+ *   - "disabled":  OAuth config is present but enabled = false.
+ *   - "enabled":   OAuth config is present, enabled, and passed validation.
+ *   - "malformed": OAuth is enabled but failed schema/semantic validation
+ *                  (remote OAuth is therefore disabled at runtime, fail-closed).
+ */
+export type RemoteOAuthConfigStatus = "absent" | "disabled" | "enabled" | "malformed";
+
+export interface RemoteOAuthConfigDiagnostics {
+  config: RemoteOAuthConfig;
+  status: RemoteOAuthConfigStatus;
+  /** True when an [http.oauth] table or OAuth env override is present at all. */
+  configured: boolean;
+  /**
+   * Concise, secret-free descriptions of why an enabled config is malformed.
+   * Empty for "absent"/"disabled"/"enabled". Never contains secret material.
+   */
+  issues: string[];
+}
+
+/**
+ * Apply the OAuth env-var compatibility overrides on top of the raw TOML block.
+ * Returns the merged object plus the list of override names applied.
+ */
+function mergeOAuthEnvOverrides(
+  rawOAuth: Record<string, unknown>,
+  env: NodeJS.ProcessEnv
+): { merged: Record<string, unknown>; envOverrides: string[] } {
+  const envOverrides: string[] = [];
+  const merged: Record<string, unknown> = { ...rawOAuth };
+
+  if (env.LLM_GATEWAY_OAUTH_ENABLED !== undefined) {
+    merged.enabled = env.LLM_GATEWAY_OAUTH_ENABLED === "1";
+    envOverrides.push("LLM_GATEWAY_OAUTH_ENABLED");
+  }
+  if (env.LLM_GATEWAY_OAUTH_REGISTRATION_SECRET || env.LLM_GATEWAY_OAUTH_SHARED_SECRET) {
+    const rawSecret =
+      env.LLM_GATEWAY_OAUTH_REGISTRATION_SECRET || env.LLM_GATEWAY_OAUTH_SHARED_SECRET;
+    merged.registration_policy = "shared_secret";
+    merged.shared_secret = {
+      enabled: true,
+      // Env-only compatibility path: plaintext is converted to a hash in memory
+      // and never written back to config.
+      secret_hash: rawSecret ? hashSecret(rawSecret) : undefined,
+      prompt_label: "Gateway access code",
+    };
+    envOverrides.push(
+      env.LLM_GATEWAY_OAUTH_REGISTRATION_SECRET
+        ? "LLM_GATEWAY_OAUTH_REGISTRATION_SECRET"
+        : "LLM_GATEWAY_OAUTH_SHARED_SECRET"
+    );
+  }
+  if (env.LLM_GATEWAY_OAUTH_REQUIRE_CONSENT !== undefined) {
+    merged.require_consent = env.LLM_GATEWAY_OAUTH_REQUIRE_CONSENT === "1";
+    envOverrides.push("LLM_GATEWAY_OAUTH_REQUIRE_CONSENT");
+  }
+  if (env.LLM_GATEWAY_OAUTH_CONSENT_SECRET) {
+    // Env-only compatibility path: plaintext hashed in memory, never persisted.
+    merged.consent_secret_hash = hashSecret(env.LLM_GATEWAY_OAUTH_CONSENT_SECRET);
+    merged.require_consent = merged.require_consent ?? true;
+    envOverrides.push("LLM_GATEWAY_OAUTH_CONSENT_SECRET");
+  }
+  return { merged, envOverrides };
+}
+
+/**
+ * Run the semantic (post-schema) validations on a parsed OAuth config. Pushes a
+ * secret-free issue string for each failure. Returns the resolved config on
+ * success, or null when any semantic check failed (fail-closed: caller returns
+ * the disabled config so remote OAuth stays off at runtime).
+ */
+function validateParsedOAuthConfig(
+  data: z.infer<typeof OAuthConfigSchema>,
+  env: NodeJS.ProcessEnv,
+  sourcePath: string | null,
+  envOverrides: string[],
+  logger: Logger,
+  issues: string[]
+): RemoteOAuthConfig | null {
+  if (data.issuer !== "auto" && !isHttpsOrLoopbackUrl(data.issuer)) {
+    logWarn(logger, "Invalid [http.oauth].issuer; remote OAuth disabled");
+    issues.push("OAuth issuer must be an https:// URL (or a loopback URL for local testing).");
+    return null;
+  }
+  for (const client of data.clients) {
+    if (!data.allow_public_clients && !client.client_secret_hash) {
+      logWarn(logger, "OAuth client secret hash is required when public clients are disabled", {
+        client_id: client.client_id,
+      });
+      issues.push(
+        "An OAuth client is missing a client_secret_hash (required when public clients are disabled). Recreate it with `llm-cli-gateway oauth client add`."
+      );
+      return null;
+    }
+    if (client.client_secret_hash && !isSecretHash(client.client_secret_hash)) {
+      logWarn(logger, "Invalid OAuth client secret hash; remote OAuth disabled", {
+        client_id: client.client_id,
+      });
+      issues.push(
+        "An OAuth client secret hash is not a valid scrypt hash. Rotate it with `llm-cli-gateway oauth client rotate`."
+      );
+      return null;
+    }
+    if (
+      client.allowed_redirect_uris.length === 0 ||
+      client.allowed_redirect_uris.some(uri => !isSafeRedirectUri(uri))
+    ) {
+      logWarn(logger, "Invalid OAuth client redirect URI; remote OAuth disabled", {
+        client_id: client.client_id,
+      });
+      issues.push(
+        "An OAuth client has a missing or non-https/loopback redirect URI. Re-add the client with a valid --redirect-uri."
+      );
+      return null;
+    }
+  }
+  if (data.shared_secret?.enabled) {
+    if (!data.shared_secret.secret_hash || !isSecretHash(data.shared_secret.secret_hash)) {
+      logWarn(logger, "Invalid [http.oauth.shared_secret] secret_hash; remote OAuth disabled");
+      issues.push(
+        "The OAuth shared-secret hash is missing or invalid. Reset it with `llm-cli-gateway oauth shared-secret set`."
+      );
+      return null;
+    }
+  }
+  if (data.registration_policy === "open_dev" && env.LLM_GATEWAY_OAUTH_OPEN_DEV !== "1") {
+    logWarn(
+      logger,
+      "[http.oauth].registration_policy='open_dev' is intended for localhost/dev only"
+    );
+  }
+  // F14b: the consent gate cannot fail closed without a credential to verify.
+  if (data.require_consent) {
+    if (!data.consent_secret_hash || !isSecretHash(data.consent_secret_hash)) {
+      logWarn(
+        logger,
+        "[http.oauth].require_consent is set but consent_secret_hash is missing/invalid; remote OAuth disabled"
+      );
+      issues.push(
+        "require_consent is set but the consent secret hash is missing or invalid. Set it with `llm-cli-gateway oauth shared-secret set` or LLM_GATEWAY_OAUTH_CONSENT_SECRET."
+      );
+      return null;
+    }
+  }
+
+  return {
+    enabled: data.enabled,
+    issuer: data.issuer,
+    requirePkce: data.require_pkce,
+    allowPlainPkce: data.allow_plain_pkce,
+    registrationPolicy: data.registration_policy as OAuthRegistrationPolicy,
+    allowPublicClients: data.allow_public_clients,
+    tokenTtlSeconds: data.token_ttl_seconds,
+    requireConsent: data.require_consent,
+    consentSecretHash: data.consent_secret_hash ?? null,
+    clients: data.clients.map(client => ({
+      clientId: client.client_id,
+      clientSecretHash: client.client_secret_hash ?? null,
+      allowedRedirectUris: client.allowed_redirect_uris,
+      scopes: client.scopes,
+    })),
+    sharedSecret: data.shared_secret
+      ? {
+          enabled: data.shared_secret.enabled,
+          secretHash: data.shared_secret.secret_hash ?? null,
+          promptLabel: data.shared_secret.prompt_label,
+        }
+      : null,
+    sources: { configFile: sourcePath, envOverrides },
+  };
+}
+
+/**
+ * Load and classify the remote OAuth config. Unlike `loadRemoteOAuthConfig`,
+ * this reports WHY OAuth is off so the readiness projection can distinguish a
+ * deliberately-disabled server from a misconfigured one. Never throws and never
+ * emits secret material.
+ */
+export function diagnoseRemoteOAuthConfig(
+  logger: Logger = noopLogger,
+  env: NodeJS.ProcessEnv = process.env
+): RemoteOAuthConfigDiagnostics {
+  const configPath = defaultGatewayConfigPath();
+  const { parsed: configFile, sourcePath } = readGatewayTomlFile(configPath, logger, "OAuth");
+  const rawHttp = (configFile?.http as Record<string, unknown> | undefined) ?? {};
+  const rawOAuth = (rawHttp.oauth as Record<string, unknown> | undefined) ?? {};
+  const { merged, envOverrides } = mergeOAuthEnvOverrides(rawOAuth, env);
+  const configured = Object.keys(rawOAuth).length > 0 || envOverrides.length > 0;
+
+  const parsed = OAuthConfigSchema.safeParse(merged);
+  if (!parsed.success) {
+    logWarn(logger, "Invalid [http.oauth] config; remote OAuth disabled", {
+      error: parsed.error.message,
+    });
+    // A parse failure can only happen when an [http.oauth] table (or override)
+    // exists, since an empty object parses to the all-default disabled config.
+    return {
+      config: disabledOAuthConfig(sourcePath, envOverrides),
+      status: "malformed",
+      configured: true,
+      issues: [
+        "The [http.oauth] config is invalid (schema validation failed); remote OAuth is disabled.",
+      ],
+    };
+  }
+
+  const data = parsed.data;
+  const issues: string[] = [];
+  const built = validateParsedOAuthConfig(data, env, sourcePath, envOverrides, logger, issues);
+  if (!built) {
+    // Semantic validation failed. Only surface it as "malformed" when the
+    // operator actually asked for OAuth (enabled); an enabled=false block with
+    // stale/invalid material is just "disabled".
+    return {
+      config: disabledOAuthConfig(sourcePath, envOverrides),
+      status: data.enabled ? "malformed" : configured ? "disabled" : "absent",
+      configured,
+      issues: data.enabled ? issues : [],
+    };
+  }
+
+  const status: RemoteOAuthConfigStatus = built.enabled
+    ? "enabled"
+    : configured
+      ? "disabled"
+      : "absent";
+  return { config: built, status, configured, issues: [] };
+}
+
+export function loadRemoteOAuthConfig(
+  logger: Logger = noopLogger,
+  env: NodeJS.ProcessEnv = process.env
+): RemoteOAuthConfig {
+  return diagnoseRemoteOAuthConfig(logger, env).config;
+}

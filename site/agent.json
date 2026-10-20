@@ -1,0 +1,44 @@
+{
+  "name": "llm-cli-gateway",
+  "description": "Secure local control plane for AI coding agents. Operate Claude Code, Codex CLI, Gemini/Antigravity, Grok Build, Mistral Vibe, Cognition Devin, Cursor Agent, and optional HTTP API providers from supported MCP clients while keeping execution workspace-scoped, approval-gated, durable, and auditable.",
+  "url": "https://llm-cli-gateway.dev/",
+  "repository": "https://github.com/verivus-oss/llm-cli-gateway",
+  "documentation": "https://llm-cli-gateway.dev/agents.md",
+  "api": "https://llm-cli-gateway.dev/tools.md",
+  "apiCatalog": "https://llm-cli-gateway.dev/.well-known/api-catalog",
+  "developerPortal": "https://llm-cli-gateway.dev/developers",
+  "openapi": "https://llm-cli-gateway.dev/openapi.json",
+  "license": "MIT",
+  "mcp": {
+    "registryName": "io.github.verivus-oss/llm-cli-gateway",
+    "transport": "stdio",
+    "transports": ["stdio", "http"],
+    "command": "npx",
+    "args": ["-y", "llm-cli-gateway"],
+    "remote": {
+      "transport": "http",
+      "start": "llm-cli-gateway --transport=http",
+      "defaultEndpoint": "http://127.0.0.1:3333/mcp",
+      "auth": ["bearer", "oauth2"]
+    }
+  },
+  "retrieval": {
+    "llmsTxt": "https://llm-cli-gateway.dev/llms.txt",
+    "install": "https://llm-cli-gateway.dev/install.md",
+    "docs": "https://llm-cli-gateway.dev/docs",
+    "apiReference": "https://llm-cli-gateway.dev/api",
+    "developers": "https://llm-cli-gateway.dev/developers",
+    "openapi": "https://llm-cli-gateway.dev/openapi.json",
+    "agents": "https://llm-cli-gateway.dev/agents.md",
+    "tools": "https://llm-cli-gateway.dev/tools.md",
+    "personalConfigKit": "https://llm-cli-gateway.dev/guides/personal-agent-config-kit.md",
+    "workflowDemo": "https://llm-cli-gateway.dev/workflows/cross-model-review.md",
+    "discoveryMatrix": "https://llm-cli-gateway.dev/DISCOVERY.md",
+    "apiCatalog": "https://llm-cli-gateway.dev/.well-known/api-catalog",
+    "aiCatalog": "https://llm-cli-gateway.dev/.well-known/ai-catalog.json",
+    "mcpServerCard": "https://llm-cli-gateway.dev/.well-known/mcp/server-card.json",
+    "sitemap": "https://llm-cli-gateway.dev/sitemap.md",
+    "sitemapXml": "https://llm-cli-gateway.dev/sitemap.xml",
+    "robots": "https://llm-cli-gateway.dev/robots.txt"
+  }
+}

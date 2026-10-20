@@ -1,0 +1,180 @@
+/**
+ * Write ordering for the flight recorder's two phases (s6, design 3.4).
+ *
+ * A rule written in a plan is an unexecuted assertion. Every entry here names
+ * the test that runs it, and `write-ordering-spec.test.ts` fails if that test
+ * does not exist, so a rule cannot quietly stop being enforced. An entry that
+ * nothing runs must say `unenforced` and say why, which is the only honest
+ * third option.
+ *
+ * Owners: s6 converted FlightOwnership and the three flight sinks; s7 moves
+ * the recorder itself onto the port and owns everything durable below it.
+ */
+export type WriteOrderingOwner = "s6" | "s7";
+
+/** Rule ids: design 3.4's own failure list, its four unspecified items, and
+ *  the three in-process invariants s6 added while converting the state machine. */
+export type WriteOrderingRuleId =
+  | "in_process_start_before_complete"
+  | "idempotence_flags_not_straddled"
+  | "inline_vs_manager_double_complete"
+  | "crash_between_start_and_complete"
+  | "cross_process_orphan_completion"
+  | "rejected_start_poisons_chain"
+  | "status_guarded_complete_updates_zero_rows"
+  | "telemetry_before_start_row"
+  | "immediate_read_after_write"
+  | "correlation_id_reuse"
+  | "unbounded_queue_growth"
+  | "start_failure_policy"
+  | "complete_timeout_semantics"
+  | "unattached_completion_side_table"
+  | "merge_fence";
+
+interface RuleBase {
+  /** The hazard, as design 3.4 states it. */
+  mode: string;
+  /** What must hold. */
+  rule: string;
+  owner: WriteOrderingOwner;
+}
+
+/**
+ * `enforced` means the rule is a property of the code and a test fails without
+ * it. `characterised` means the test pins what happens TODAY, including a loss,
+ * so s7 has a target rather than a paragraph. `unenforced` means decided but
+ * not yet running anywhere.
+ */
+export type WriteOrderingRule = RuleBase &
+  (
+    | { status: "enforced" | "characterised"; verifiedBy: readonly [string, ...string[]] }
+    | { status: "unenforced"; unenforcedBecause: string }
+  );
+
+export const WRITE_ORDERING_RULES = {
+  in_process_start_before_complete: {
+    mode: "A completion can reach the database before the start row it attaches to.",
+    rule: "FlightOwnership serialises this request's writes on one chain, so completeInline's sink runs only after start's sink has settled. Independently, every caller awaits start() before execute dispatches, which puts the start row down before the async manager can be armed to complete it.",
+    owner: "s6",
+    status: "enforced",
+    verifiedBy: [
+      "orders the completion sink behind a still-pending start sink",
+      "does not complete the flight while logStart is still pending",
+      "awaits every flight.start and flight.completeInline call site in index.ts",
+    ],
+  },
+  idempotence_flags_not_straddled: {
+    mode: "Awaiting inside a state machine whose idempotence is a boolean makes the boolean a race.",
+    rule: "started and managerOwnsCompletion are read and set in the synchronous prologue, before the first await. A concurrent second call therefore cannot pass a guard the first has already claimed.",
+    owner: "s6",
+    status: "enforced",
+    verifiedBy: [
+      "a second concurrent start() enqueues exactly one start write",
+      "a flag set after an await would admit a second write (negative control)",
+    ],
+  },
+  inline_vs_manager_double_complete: {
+    mode: "H-DoubleComplete: the handler inline-completes a flight the async manager was armed to finish.",
+    rule: "transferCompletionToManager is synchronous and completeInline reads the flag before yielding, so a transfer taken while an earlier write is in flight still fences every later inline completion.",
+    owner: "s6",
+    status: "enforced",
+    verifiedBy: ["fences a completion transferred while an earlier write is in flight"],
+  },
+  crash_between_start_and_complete: {
+    mode: "Process crash or SIGKILL between start and complete.",
+    rule: "The start row must survive the crash so a later instance can attach a completion to it. Nothing in process can cover this, which is why design revision 1's in-process queue was withdrawn.",
+    owner: "s7",
+    status: "characterised",
+    verifiedBy: [
+      "a SIGKILL after logStart leaves a durable started row a new process can complete",
+    ],
+  },
+  cross_process_orphan_completion: {
+    mode: "Orphan completion by a different gateway instance (async-job-manager #139 sweep).",
+    rule: "A second instance completing another instance's row must land on the existing row and must not duplicate it. An in-process queue cannot see this case at all.",
+    owner: "s7",
+    status: "characterised",
+    verifiedBy: ["a second recorder instance completes the first instance's started row"],
+  },
+  rejected_start_poisons_chain: {
+    mode: "A rejected logStart promise poisoning or bypassing the chain.",
+    rule: "The chain tail is a swallowed copy, so a rejected start neither stops later writes nor lets them jump ahead, and it raises no unhandled rejection at any of the terminal branches.",
+    owner: "s6",
+    status: "enforced",
+    verifiedBy: ["a rejected start sink neither poisons nor bypasses the chain"],
+  },
+  status_guarded_complete_updates_zero_rows: {
+    mode: "A status-guarded logComplete matching zero rows.",
+    rule: "The metadata half of logComplete is fenced to status started, so a completion with no start row silently changes nothing and the response body is lost. s7 must route it to reconciliation rather than dropping it.",
+    owner: "s7",
+    status: "characterised",
+    verifiedBy: ["a completion with no start row changes nothing and loses the response"],
+  },
+  telemetry_before_start_row: {
+    mode: "recordRouting or compression telemetry racing a missing start row.",
+    rule: "Both are post-hoc updates keyed on the request id, so before the start row exists they match nothing and the telemetry is lost. s7 moved them onto the port, so they are now transactions on the driver's single write queue and can no longer OVERTAKE a start write submitted before them. They are still not on FlightOwnership's request-scoped chain, and the loss when they are DECIDED before the start row is unchanged: the update matches nothing and says nothing.",
+    owner: "s7",
+    status: "characterised",
+    verifiedBy: ["routing telemetry written before the start row is lost"],
+  },
+  immediate_read_after_write: {
+    mode: "Immediate read-after-write.",
+    rule: "The recorder reads through a separate read-only connection. A read issued straight after a write must observe it.",
+    owner: "s7",
+    status: "characterised",
+    verifiedBy: ["a read issued immediately after logStart observes the row"],
+  },
+  correlation_id_reuse: {
+    mode: "Correlation-id reuse attaching a stale completion to an unrelated later start.",
+    rule: "The request id is the primary key, so a reused id cannot start a second flight, and a later completion attaches to the FIRST row. The sinks swallow the collision, so nothing today tells the caller.",
+    owner: "s7",
+    status: "characterised",
+    verifiedBy: ["a reused correlation id attaches the completion to the first row"],
+  },
+  unbounded_queue_growth: {
+    mode: "Unbounded growth of the per-correlation queue map.",
+    rule: "There is no map. The chain is a field on the request-scoped FlightOwnership and is collected with the request, which is the structural answer rather than an eviction policy.",
+    owner: "s6",
+    status: "enforced",
+    verifiedBy: ["keeps no cross-request state, so there is no queue map to grow"],
+  },
+  start_failure_policy: {
+    mode: "logStart failure policy: propagating fails the request, swallowing leaves no row to attach to.",
+    rule: "Swallow and log, and make it structural rather than per call site: the sinks catch with the await INSIDE the try, and FlightOwnership hands callers a tail that cannot reject. Design 3.4 asks the port to establish logging must never FAIL a request; this is that half. The lost-row half is the side table, below.",
+    owner: "s6",
+    status: "enforced",
+    verifiedBy: ["logs and survives a rejecting logStart rather than failing the request"],
+  },
+  complete_timeout_semantics: {
+    mode: "A bounded completion write, where a race-style timeout neither cancels the query nor establishes whether it committed.",
+    rule: "The bound must cancel the query and destroy the connection, never merely stop waiting. s7 applies s13's mechanism rather than growing a second one: every recorder write goes through driver.transaction, which arms STORAGE_TRANSACTION_DEADLINE_MS and, on SQLite, refuses the next statement and ROLLS BACK rather than abandoning anything. Two tests in a chain, because inheritance is the claim: one shows the recorder's four writes really do route through driver.transaction, the other shows what that bound does.",
+    owner: "s7",
+    status: "enforced",
+    verifiedBy: [
+      "each operation routes with the class it declared",
+      "ends a transaction that outlives its bound, and the write does NOT land",
+    ],
+  },
+  unattached_completion_side_table: {
+    mode: "A completion with no start row cannot fabricate one: FlightLogResult carries no cli, model, prompt or start time and those columns are not nullable.",
+    rule: "Such completions go to a reconciliation side table, never dropped and never fabricated. Its owner, access policy, retention and reuse protection are s7's to define with the transcript schema, because the side table is part of that schema.",
+    owner: "s7",
+    status: "unenforced",
+    unenforcedBecause:
+      "BLOCKED, not pending. The side table is part of the transcript schema, and operator decision 0a stops s7 before any transcript-schema authorship: bodies do not enter Postgres until postgres-security-hardening.md section 6 is complete through step 8, and it is at step 2 of 10. Writing a SQLite-only side table now would either be thrown away at the cutover or become a second schema to migrate. It stays a named, unimplemented rule rather than a surface with no implementer.",
+  },
+  merge_fence: {
+    mode: "A delayed first completion arriving after the final one overwrites the final response.",
+    rule: "SETTLED BY EXPERIMENT at s7 and BUILT at migrations/023. s7 characterised it and could not fix it: the fence needs a column, and operator decision 0a stopped transcript-schema authorship at the time. The column exists now, so the rule is enforced rather than described. A completion is OBSERVED (this process saw the provider terminate) or PRESUMED (the #139 sweep decided a job was dead), carried as `gateway_metadata.completion_rank` 2 and 1, and a completion lands only where its rank is >= the stored one. Note that BOTH obvious fences are wrong: last-writer-wins loses the real answer when the sweep lands second, which is what s7 measured, and fencing on `status <> 'started'` loses it when the sweep lands FIRST, which is the more common ordering and a worse regression. Authority, not arrival, is the only rule that survives both. The body and the status are now fenced identically; s7's split, where the body was last-wins and the status monotonic, is what made the loss invisible. RANK 3 IS RESERVED for imported history: the s10 cutover copies rows from a `logs.db` that predates this engine, and `FlightLogResult.completionKind` deliberately cannot express 3, so no live completion can reach a migrated row. That reservation is load-bearing rather than decorative, because the cutover cannot fence PostgreSQL: a gateway starting mid-copy is stopped from OVERWRITING A MIGRATED BODY by the rank and by nothing else. Its reach was once the BODY alone, but SQL_UPDATE_ROUTING and SQL_UPDATE_COMPRESSION now carry the same `completion_rank < 3` fence (#287), so a migrated row's routing and compression metadata are protected too. The one write path still without a provenance notion is the retention DELETE: a migrated row is old by construction, so age-based retention removes it wherever retention is configured. That is a deliberate policy choice rather than an oversight, and the claim still must not be widened to immutability while retention can delete. Note also that the rank only protects a row that actually CARRIES it: the cutover must write the literal 3 and then assert it, because an omitted column lands at DEFAULT 0 and every later check that compares the two sides is blind to the one value the copy invents. Giving 3 a second meaning would make imported history overwritable again and nothing would fail until a transcript was found to have been quietly replaced.",
+    owner: "s7",
+    status: "enforced",
+    verifiedBy: [
+      "a late second completion refreshes the response and the status together",
+      "RANK 3 is reserved for imported history and nothing live can complete it",
+      "across writers: a PRESUMED completion landing second cannot overwrite the observed one",
+      "across writers: an OBSERVED completion landing second replaces the presumption",
+      "a second PRESUMED completion cannot overwrite the first presumption's body",
+      "NOT reachable within one recorder: submission order is landing order",
+    ],
+  },
+} as const satisfies Record<WriteOrderingRuleId, WriteOrderingRule>;

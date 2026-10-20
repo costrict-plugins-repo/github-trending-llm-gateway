@@ -1,0 +1,91 @@
+# NO TRAILING SLASHES on plain directory names, deliberately.
+# `foo/` matches a DIRECTORY only. A SYMLINK named `foo` is not matched, so
+# `git add -A` commits it. That happened twice on one branch: a `node_modules`
+# symlink pointing at the main checkout broke every npm job in CI, and the
+# `.scratch/` entry added to prevent a repeat had a trailing slash and did not.
+# A bare name matches a file, a directory and a symlink alike, which is what
+# every entry below actually wants. Globs and the `!` negation keep their form.
+node_modules
+dist
+
+# Prod-only shrinkwrap: GENERATED at pack/publish time by
+# scripts/make-prod-shrinkwrap.mjs and shipped in the npm tarball only.
+# Never commit it: npm ci / npm install treat a present npm-shrinkwrap.json
+# as the authoritative lockfile, and the prod-only projection (no dev deps)
+# breaks every dev/CI install with EUSAGE "lock file out of sync".
+npm-shrinkwrap.json
+
+# MCP Registry publishing
+mcp-publisher
+server.json
+
+# Python build artifacts
+__pycache__
+*.py[cod]
+*.egg-info/
+*.egg
+.eggs
+build
+*.dist-info/
+
+# sqry tool cache (generated per-index; not source)
+.sqry
+.sqry-cache
+.sqry-index
+.preexisting-doctor-index.patch.bak
+.review-unit-*-prompt.md
+docs/personal-mcp/socket-release-assessment-prompt.md
+
+# Local agent/worktree artifacts
+.claude/*
+# Track internal skills (e.g. supply-chain-guard) while ignoring local .claude state.
+!.claude/skills/
+!.claude/skills/**
+.gateway
+.worktrees
+.r3-poll.mjs
+
+# Host-specific restart/deployment notes for this private checkout.
+.agents/skills/gateway-restart-surfaces
+docs/plans/hybrid-multi-agent-playbook-evolution.dag.toml
+
+# Internal agent working guide — internal repo/release context, must not ship
+AGENTS.md
+
+# Local MCP client configs may contain machine paths, account IDs, and secret refs.
+windows-mcp-config-with-gateway.json
+
+# Stray pnpm artifacts (this repo uses npm; reject reviewer-tool drift)
+pnpm-lock.yaml
+pnpm-workspace.yaml
+.playwright-mcp
+.supply-chain
+
+# Reviewer/agent scratch: vibe writes .vibe/tmp when run with workingDir here
+.vibe
+
+# Host-local records, never committed. This repo mirrors to a public GitHub
+# repo, and internal process is not product. Plans stay public and carry the
+# conclusions; the measurements and operator decisions behind them stay here.
+# No trailing slash, deliberately. A trailing-slash pattern matches directories
+# only, and these are SYMLINKS into the private internal-records repo. git treats
+# a symlink as a file, so `docs/evidence/` left them untracked-but-visible and a
+# `git add -A` would have committed the link, publishing the private repo's path.
+docs/audits
+docs/evidence
+
+# Review briefs and their verification records: process, not product, and they
+# must never reach the public mirror. Same reason as docs/audits.
+#
+# The two patterns below were written for the exact filenames in front of me at
+# the time and matched nothing since: VERIFICATION-R6.md and BRIEF-R6.md both
+# sat untracked-but-VISIBLE for a whole round. Untracked is not safe here, it
+# is one `git add -A` away from published, and this session has already swept
+# up a node_modules symlink, .scratch and a .msg file that way. Match the
+# PREFIX, so the next round's filename is covered before it is invented.
+REVIEW-SPEC-*.md
+VERIFICATION-*.md
+BRIEF-*.md
+*-VERIFICATION-REPORT.md
+.scratch
+.msg

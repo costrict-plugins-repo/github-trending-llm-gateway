@@ -1,0 +1,643 @@
+import { describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import {
+  buildSnapshotPayload,
+  codexChangelogRssSemanticSnapshot,
+  compareHelpFlagShapes,
+  compareSourceSnapshot,
+  compareTargetVersion,
+  extractRootCommands,
+  githubReleaseSemanticSnapshot,
+  normalizeSnapshot,
+  parseTrustedInstalledVersion,
+  probeInstalledCliSubcommands,
+  probeInstalledCliSurface,
+  renderReport,
+  requireInstalledHelpProbeErrorIsCritical,
+  requireInstalledVersionIndeterminateIsCritical,
+  rootCatalogDrift,
+  verifyDeclaredCommandPath,
+} from "../../scripts/upstream-scan.mjs";
+// The trust predicate now lives in the runtime module (the scanner imports it
+// via loadMachinery); the scanner no longer keeps a duplicate copy. See F4.
+import { subcommandHelpProbeIsUntrusted } from "../upstream-contracts.js";
+
+describe("upstream scanner hardening", () => {
+  it("compares stable GitHub release semantics instead of mutable API payload fields", () => {
+    const url = "https://api.github.com/repos/example/tool/releases/latest";
+    const before = githubReleaseSemanticSnapshot(
+      url,
+      JSON.stringify({
+        tag_name: "v2.19.1",
+        name: "v2.19.1",
+        draft: false,
+        prerelease: false,
+        published_at: "2026-07-01T00:00:00Z",
+        target_commitish: "main",
+        body: "Release notes",
+        updated_at: "2026-07-01T00:00:00Z",
+        assets: [{ download_count: 1 }],
+      })
+    );
+    const transportOnlyChange = githubReleaseSemanticSnapshot(
+      url,
+      JSON.stringify({
+        tag_name: "v2.19.1",
+        name: "v2.19.1",
+        draft: false,
+        prerelease: false,
+        published_at: "2026-07-01T00:00:00Z",
+        target_commitish: "main",
+        body: "Release notes",
+        updated_at: "2026-07-13T00:00:00Z",
+        assets: [{ download_count: 99 }],
+      })
+    );
+    const releaseChange = githubReleaseSemanticSnapshot(
+      url,
+      JSON.stringify({
+        tag_name: "v2.20.0",
+        name: "v2.20.0",
+        draft: false,
+        prerelease: false,
+        published_at: "2026-07-13T00:00:00Z",
+        target_commitish: "main",
+        body: "New release notes",
+      })
+    );
+
+    expect(
+      compareSourceSnapshot({ semantic: before }, { semantic: transportOnlyChange })
+    ).toMatchObject({
+      changed: false,
+      comparison: "semantic",
+    });
+    expect(compareSourceSnapshot({ semantic: before }, { semantic: releaseChange })).toMatchObject({
+      changed: true,
+      comparison: "semantic",
+    });
+    expect(compareSourceSnapshot({ sha256: "legacy" }, { semantic: before })).toEqual({
+      changed: false,
+      comparison: "semantic-baseline-initialized",
+    });
+  });
+
+  it("normalizes Codex RSS to CLI and watched contract entries", () => {
+    const url = "https://learn.chatgpt.com/docs/changelog/rss.xml";
+    const item = ({
+      guid,
+      link = guid,
+      title,
+      content,
+      pubDate = "Mon, 13 Jul 2026 00:00:00 GMT",
+    }) =>
+      `<item><title>${title}</title><link>${link}</link><guid>${guid}</guid><pubDate>${pubDate}</pubDate><content:encoded><![CDATA[${content}]]></content:encoded></item>`;
+    const rss = (items, lastBuildDate = "Mon, 13 Jul 2026 00:00:00 GMT") =>
+      `<rss><channel><lastBuildDate>${lastBuildDate}</lastBuildDate>${items.join("")}</channel></rss>`;
+
+    const appEntry = item({
+      guid: "https://developers.openai.com/codex/changelog/#codex-2026-07-09-app",
+      title: "Codex app",
+      content: "Review tasks and improve session recovery.",
+    });
+    const mobileEntry = item({
+      guid: "https://developers.openai.com/codex/changelog/#codex-2026-07-06-mobile",
+      title: "Codex mobile",
+      content: "Review sessions more quickly on iOS.",
+    });
+    const unsuffixedAppEntry = item({
+      guid: "https://developers.openai.com/codex/changelog/#codex-2026-07-08",
+      title: "Introducing the Codex app",
+      content: "Review session history more quickly.",
+    });
+    const linkClassifiedMobileEntry = item({
+      guid: "https://developers.openai.com/codex/changelog/#codex-2026-07-07",
+      link: "https://developers.openai.com/codex/mobile",
+      title: "Release notes",
+      content: "Review session history more quickly.",
+    });
+    const cliEntry = item({
+      guid: "https://developers.openai.com/codex/changelog/#codex-2026-07-01-cli",
+      title: "Codex CLI",
+      content: "Use `codex exec resume --sandbox workspace-write` for a follow-up.",
+    });
+    const appCliEntry = item({
+      guid: "https://developers.openai.com/codex/changelog/#codex-2026-07-10-app",
+      title: "Codex app",
+      content: "The shared CLI workflow now supports `codex exec --app-cli-flag`.",
+    });
+
+    const before = codexChangelogRssSemanticSnapshot(
+      url,
+      rss([appEntry, mobileEntry, unsuffixedAppEntry, linkClassifiedMobileEntry, cliEntry])
+    );
+    const routineChurn = codexChangelogRssSemanticSnapshot(
+      url,
+      rss(
+        [
+          mobileEntry,
+          appEntry,
+          unsuffixedAppEntry,
+          linkClassifiedMobileEntry,
+          item({
+            guid: "https://developers.openai.com/codex/changelog/#codex-2026-07-01-cli",
+            title: "Codex CLI",
+            content: "\nUse  `codex exec resume --sandbox workspace-write`\nfor a follow-up.\n",
+          }),
+        ],
+        "Tue, 14 Jul 2026 00:00:00 GMT"
+      )
+    );
+    const changedSandboxMode = codexChangelogRssSemanticSnapshot(
+      url,
+      rss([
+        appEntry,
+        mobileEntry,
+        item({
+          guid: "https://developers.openai.com/codex/changelog/#codex-2026-07-01-cli",
+          title: "Codex CLI",
+          content: "Use `codex exec resume --sandbox danger-full-access` for a follow-up.",
+        }),
+      ])
+    );
+    const newCliFlag = codexChangelogRssSemanticSnapshot(
+      url,
+      rss([
+        appEntry,
+        mobileEntry,
+        cliEntry,
+        item({
+          guid: "https://developers.openai.com/codex/changelog/#codex-2026-07-14-cli",
+          title: "CLI update",
+          content: "Run `codex exec --future-flag` to enable the new workflow.",
+        }),
+      ])
+    );
+    const appCliChange = codexChangelogRssSemanticSnapshot(
+      url,
+      rss([appEntry, mobileEntry, cliEntry, appCliEntry])
+    );
+
+    expect(before?.fields.entries).toEqual([
+      {
+        guid: "https://developers.openai.com/codex/changelog/#codex-2026-07-01-cli",
+        title: "Codex CLI",
+        contentSha256: expect.any(String),
+      },
+    ]);
+    expect(compareSourceSnapshot({ semantic: before }, { semantic: routineChurn })).toMatchObject({
+      changed: false,
+      comparison: "semantic",
+    });
+    expect(
+      compareSourceSnapshot({ semantic: before }, { semantic: changedSandboxMode })
+    ).toMatchObject({ changed: true, comparison: "semantic" });
+    expect(compareSourceSnapshot({ semantic: before }, { semantic: newCliFlag })).toMatchObject({
+      changed: true,
+      comparison: "semantic",
+    });
+    expect(compareSourceSnapshot({ semantic: before }, { semantic: appCliChange })).toMatchObject({
+      changed: true,
+      comparison: "semantic",
+    });
+    expect(appCliChange?.fields.entries).toContainEqual({
+      guid: "https://developers.openai.com/codex/changelog/#codex-2026-07-10-app",
+      title: "Codex app",
+      contentSha256: expect.any(String),
+    });
+    expect(
+      codexChangelogRssSemanticSnapshot("https://example.test/feed", rss([cliEntry]))
+    ).toBeNull();
+  });
+
+  it("compares explicit version probes including build suffixes", () => {
+    expect(compareTargetVersion("claude 2.1.210", "2.1.210 (Claude Code)").matches).toBe(true);
+    expect(
+      compareTargetVersion("cursor-agent 2026.07.09-c59fd9a", "cursor-agent 2026.07.09-a3815c0")
+        .matches
+    ).toBe(false);
+  });
+
+  it("treats an unconfirmed installed version as critical only under --require-installed", () => {
+    const parsed = { targetVersion: "claude 2.1.211", installedVersion: "2.1.211", matches: true };
+    const mismatch = { targetVersion: "claude 2.1.211", installedVersion: "2.1.9", matches: false };
+    const unparseable = { targetVersion: "claude 2.1.211", installedVersion: null, matches: null };
+    const noTarget = { targetVersion: null, installedVersion: null, matches: null };
+
+    // A clean match or mismatch is decided elsewhere, never here.
+    expect(requireInstalledVersionIndeterminateIsCritical(true, parsed)).toBe(false);
+    expect(requireInstalledVersionIndeterminateIsCritical(true, mismatch)).toBe(false);
+
+    // The fail-open the fix closes: require-installed + a declared target we
+    // could not confirm must be critical instead of a silent log.
+    expect(requireInstalledVersionIndeterminateIsCritical(true, unparseable)).toBe(true);
+    expect(requireInstalledVersionIndeterminateIsCritical(true, undefined)).toBe(false);
+
+    // Without require-installed, or without a declared target, it stays a log.
+    expect(requireInstalledVersionIndeterminateIsCritical(false, unparseable)).toBe(false);
+    expect(requireInstalledVersionIndeterminateIsCritical(true, noTarget)).toBe(false);
+  });
+
+  it("escalates a nonzero-exit help probe to critical only under --require-installed", () => {
+    const okHelp = { available: true, helpExitedNonzero: false };
+    const failedHelp = { available: true, helpExitedNonzero: true };
+    const absentHelp = { available: false, helpExitedNonzero: false };
+
+    // The fail-open the fix closes: a help probe that spawned but exited nonzero
+    // produced untrustworthy help text, so under --require-installed its contract
+    // is unverified and this must be critical.
+    expect(requireInstalledHelpProbeErrorIsCritical(true, failedHelp)).toBe(true);
+
+    // A clean help exit, an absent binary (decided elsewhere), and runs without
+    // --require-installed are not this critical.
+    expect(requireInstalledHelpProbeErrorIsCritical(true, okHelp)).toBe(false);
+    expect(requireInstalledHelpProbeErrorIsCritical(true, absentHelp)).toBe(false);
+    expect(requireInstalledHelpProbeErrorIsCritical(false, failedHelp)).toBe(false);
+    expect(requireInstalledHelpProbeErrorIsCritical(true, undefined)).toBe(false);
+  });
+
+  it("treats a subcommand help probe that could not run as untrusted, not drift-free", () => {
+    const strict = { helpProbeExitTolerant: false };
+    const tolerant = { helpProbeExitTolerant: true };
+
+    // The fail-open the fix closes: the root binary spawned, but the SUBCOMMAND
+    // help probe never completed (timeout / EACCES => available:false). That is
+    // an unverified contract, not an absent path, so a non-tolerant subcommand
+    // must flag it (and, downstream, --require-installed escalates it).
+    expect(subcommandHelpProbeIsUntrusted(strict, { available: false, status: null })).toBe(true);
+    // A subcommand that ran but exited nonzero is likewise untrusted.
+    expect(subcommandHelpProbeIsUntrusted(strict, { available: true, status: 1 })).toBe(true);
+    // A clean exit is trusted.
+    expect(subcommandHelpProbeIsUntrusted(strict, { available: true, status: 0 })).toBe(false);
+
+    // A help-exit-tolerant subcommand tolerates a nonzero EXIT STATUS, so a probe
+    // that ran (available:true) is trusted whatever its status. It does NOT
+    // tolerate a probe that never ran: a spawn failure produced no help to
+    // compare, so it is still untrusted.
+    expect(subcommandHelpProbeIsUntrusted(tolerant, { available: true, status: 1 })).toBe(false);
+    expect(subcommandHelpProbeIsUntrusted(tolerant, { available: true, status: 0 })).toBe(false);
+    expect(subcommandHelpProbeIsUntrusted(tolerant, { available: false, status: null })).toBe(true);
+  });
+
+  it("sets helpExitedNonzero on a subcommand help probe that fails to spawn (wiring, not just the predicate)", () => {
+    // Pins the fix end-to-end, not only the leaf predicate: probeInstalledCliSubcommands
+    // must actually route a spawn-failed subcommand probe through the predicate and
+    // set the probe's helpExitedNonzero flag. A machinery mock forces the root help
+    // to discover the subcommand (so its path is not "missing") but makes the
+    // subcommand help probe spawn-fail (resolveCommandForSpawn -> a path that ENOENTs).
+    const subDef = { commandPath: ["update"], helpArgs: [["--help"]], aliases: [] };
+    const contract = { executable: "faketool", subcommands: [subDef] };
+    const rootHelp = { available: true, commands: ["update"], helpHash: "root-hash" };
+    const machinery = {
+      subcommandHelpProbeIsUntrusted,
+      flattenCliSubcommands: subs => subs,
+      getExtendedPath: () => process.env.PATH ?? "",
+      envWithExtendedPath: env => env,
+      // The subcommand help probe resolves to a binary that cannot be spawned, so
+      // spawnSync returns result.error and runReadOnlyCliCommand reports available:false.
+      resolveCommandForSpawn: (_executable, args) => ({
+        command: "/nonexistent/faketool-does-not-exist-xyz",
+        args,
+      }),
+      // Only reached when available:true, which never happens here; provided for safety.
+      extractDiscoveredFlags: () => [],
+      computeSubcommandFlagDrift: () => ({
+        missingFlags: [],
+        extraFlags: [],
+        acknowledgedExtraFlags: [],
+        warnings: [],
+      }),
+    };
+
+    const probes = probeInstalledCliSubcommands(machinery, contract, rootHelp, 2000);
+    const probe = probes.update;
+    expect(probe).toBeDefined();
+    expect(probe.available).toBe(false);
+    // The spawn-failed, non-tolerant subcommand is flagged, so the surface fold
+    // (Object.values(subcommands).some(p => p.helpExitedNonzero)) escalates it.
+    expect(probe.helpExitedNonzero).toBe(true);
+    expect(probe.existence).not.toBe("missing");
+  });
+
+  // Both cases share this: a subcommand advertised in root help whose own
+  // --help returns the root help verbatim (fellBackToRoot). Whether that keeps
+  // it "present" (a declared alias) or reports "missing" (an undeclared command,
+  // preserving removal detection) is the scoped behaviour under review in #319.
+  const rootFallbackProbe = subDef => {
+    const ROOT_HELP = "usage: faketool [PROMPT]\n\nCommands:\n  update  Update now.\n";
+    // runReadOnlyCliCommand returns `${stdout}\n${stderr}`, so the probe's help
+    // text (stdout=ROOT_HELP, stderr="") hashes ROOT_HELP + "\n".
+    const outputHash = createHash("sha256").update(`${ROOT_HELP}\n`).digest("hex");
+    const contract = { executable: "faketool", subcommands: [subDef] };
+    const rootHelp = { available: true, commands: ["update"], helpHash: outputHash };
+    const machinery = {
+      subcommandHelpProbeIsUntrusted,
+      flattenCliSubcommands: subs => subs,
+      getExtendedPath: () => process.env.PATH ?? "",
+      envWithExtendedPath: env => env,
+      // Spawn succeeds and prints the root help verbatim, so its output hashes to
+      // rootHelp.helpHash and fellBackToRoot is true.
+      resolveCommandForSpawn: () => ({
+        command: process.execPath,
+        args: ["-e", `process.stdout.write(${JSON.stringify(ROOT_HELP)})`],
+      }),
+      extractDiscoveredFlags: () => [],
+      computeSubcommandFlagDrift: () => ({
+        missingFlags: [],
+        extraFlags: [],
+        acknowledgedExtraFlags: [],
+        warnings: [],
+      }),
+    };
+    return probeInstalledCliSubcommands(machinery, contract, rootHelp, 5000).update;
+  };
+
+  it("keeps a DECLARED alias present when its --help falls back to root help (helpFallsBackToRoot)", () => {
+    // The mistral `vibe update` case: advertised in root help (an alias for
+    // --check-upgrade), `vibe update --help` returns root help verbatim. With
+    // helpFallsBackToRoot declared, that root-hash match must NOT downgrade it.
+    const probe = rootFallbackProbe({
+      commandPath: ["update"],
+      helpArgs: [["--help"]],
+      aliases: [],
+      helpFallsBackToRoot: true,
+    });
+    expect(probe).toBeDefined();
+    expect(probe.existence).toBe("present");
+    // Its help is still not used for flag comparison (root-fallback).
+    expect(probe.available).toBe(false);
+  });
+
+  it("still reports MISSING for an UNDECLARED command whose --help falls back to root (preserves removal detection; #319 codex blocker)", () => {
+    // Same fixture WITHOUT helpFallsBackToRoot: a command stale-advertised in
+    // parent help but genuinely removed presents this way (its --help falls back
+    // to root). The scan must keep flagging it as drift rather than silently
+    // accept it as present, so removal detection is not lost.
+    const probe = rootFallbackProbe({
+      commandPath: ["update"],
+      helpArgs: [["--help"]],
+      aliases: [],
+    });
+    expect(probe).toBeDefined();
+    expect(probe.existence).toBe("missing");
+    expect(probe.available).toBe(false);
+  });
+
+  // The scanner imports the shared predicate from the compiled runtime via
+  // loadMachinery(); a stale or missing dist would drop the F4 escalation.
+  // loadMachinery hard-fails on a missing export, and this pins the symbol so a
+  // build that forgot to compile the runtime change is caught by the suite too.
+  // Skip when dist/ is absent so a clean-checkout `npm test` (no build step, see
+  // package.json) does not fail on a missing module; `npm run check` and CI build
+  // first, so the guard still runs there.
+  const distContractsPath = fileURLToPath(
+    new URL("../../dist/upstream-contracts.js", import.meta.url)
+  );
+  it.skipIf(!existsSync(distContractsPath))(
+    "exports subcommandHelpProbeIsUntrusted from the BUILT dist (loadMachinery/build-order guard)",
+    async () => {
+      const dist = await import(distContractsPath);
+      expect(typeof dist.subcommandHelpProbeIsUntrusted).toBe("function");
+      // Behaviour parity with the TS source: a nonzero non-tolerant exit is untrusted.
+      expect(
+        dist.subcommandHelpProbeIsUntrusted(
+          { helpProbeExitTolerant: false },
+          { available: true, status: 1 }
+        )
+      ).toBe(true);
+    }
+  );
+
+  it("preserves an earlier nonzero root helpArgs exit when a later helpArgs spawn-fails (surface early return)", () => {
+    // Mirror of the runtime probeInstalledCliContract fix: contract.helpArgs can
+    // hold more than one entry. The first spawns and exits nonzero (untrusted
+    // help), the second spawn-fails and triggers the early return. The early
+    // return must carry helpExitedNonzero (the accumulator), not drop it.
+    const contract = { executable: "faketool", helpArgs: [["a"], ["b"]], subcommands: [] };
+    const machinery = {
+      UPSTREAM_CLI_CONTRACTS: { faketool: contract },
+      getExtendedPath: () => process.env.PATH ?? "",
+      envWithExtendedPath: env => env,
+      resolveCommandForSpawn: (_executable, args) =>
+        args[0] === "b"
+          ? // Second helpArgs: a binary that cannot be spawned (ENOENT -> available:false).
+            { command: "/nonexistent/faketool-does-not-exist-xyz", args }
+          : // First helpArgs: spawns but exits nonzero.
+            { command: "sh", args: ["-c", "exit 1"] },
+    };
+
+    const probe = probeInstalledCliSurface(machinery, "faketool", 2000);
+    expect(probe.available).toBe(false);
+    expect(probe.helpExitedNonzero).toBe(true);
+  });
+
+  it("does not trust a --version that exits nonzero, closing the parse fail-open", () => {
+    // A clean exit-0 probe yields the parsed version line.
+    expect(parseTrustedInstalledVersion({ available: true, status: 0, output: "2.1.211" })).toBe(
+      "2.1.211"
+    );
+
+    // The fail-open: --version exits nonzero but prints a string that parses to
+    // the target. Trusting it would pass the gate with the CLI unverified. The
+    // fix returns null, which compareTargetVersion turns into an indeterminate
+    // match that --require-installed escalates to a critical.
+    for (const status of [1, 3, 127, null]) {
+      const untrusted = parseTrustedInstalledVersion({
+        available: true,
+        status,
+        output: "2.1.211",
+      });
+      expect(untrusted).toBeNull();
+      const probe = {
+        targetVersion: "cli 2.1.211",
+        ...compareTargetVersion("cli 2.1.211", untrusted),
+      };
+      expect(probe.matches).toBeNull();
+      expect(requireInstalledVersionIndeterminateIsCritical(true, probe)).toBe(true);
+    }
+
+    // A spawn that never ran (available:false) is also untrusted.
+    expect(parseTrustedInstalledVersion({ available: false, status: null, output: "" })).toBeNull();
+  });
+
+  it("discovers root commands, handles aliases, and guards missing paths before help", () => {
+    const commands = extractRootCommands(`
+Commands:
+  agent|agents  List configured agents
+  list          List sessions [aliases: ls]
+  help          Print help
+
+Options:
+  --version     Print version
+`);
+    expect(commands).toEqual(["agent", "agents", "help", "list"]);
+
+    const drift = rootCatalogDrift(
+      [
+        { commandPath: ["agent"], aliases: ["agents"] },
+        { commandPath: ["list"], aliases: ["ls"] },
+      ],
+      commands
+    );
+    expect(drift).toEqual({ added: [], removed: [] });
+
+    expect(
+      rootCatalogDrift(
+        [
+          { commandPath: ["plugin"], aliases: ["plugins"] },
+          { commandPath: ["plugins"], aliases: ["plugin"] },
+        ],
+        ["plugin"]
+      )
+    ).toEqual({ added: [], removed: [] });
+
+    const checkedParents: string[] = [];
+    const missing = verifyDeclaredCommandPath(["ssh"], commandPath => {
+      checkedParents.push(commandPath.join(" "));
+      return { available: true, commands };
+    });
+    expect(missing.state).toBe("missing");
+    expect(checkedParents).toEqual([""]);
+
+    const alias = verifyDeclaredCommandPath(
+      ["plugins"],
+      () => ({ available: true, commands: ["plugin"] }),
+      new Map([["plugins", ["plugin"]]])
+    );
+    expect(alias.state).toBe("present");
+  });
+
+  it("compares only explicit root flag shapes and values", () => {
+    const contract = {
+      flags: {
+        "--permission-mode": { arity: "one", values: ["auto"] },
+        "--resume": { arity: "optional" },
+        // An upstream variadic flag still accepts the gateway's one-value use.
+        "--add-dir": { arity: "one" },
+      },
+    };
+    const help = `
+Options:
+  --permission-mode <MODE>  Permission mode (choices: "auto", "manual")
+  --resume <ID>             Resume by ID
+  --add-dir <DIR...>        Additional directories
+`;
+    const drift = compareHelpFlagShapes(contract, help);
+
+    expect(drift.enumMismatches).toEqual([
+      {
+        flag: "--permission-mode",
+        missingValues: [],
+        extraValues: ["manual"],
+        installedValues: ["auto", "manual"],
+      },
+    ]);
+    expect(drift.arityMismatches).toEqual([
+      { flag: "--resume", contractArity: "optional", installedArity: "one" },
+    ]);
+  });
+
+  it("normalizes v1 snapshot flags into canonical discoveredFlags", () => {
+    const snapshot = normalizeSnapshot({
+      helpSurface: { flags: ["--root"] },
+      subcommands: { inspect: { flags: ["--json"] } },
+    });
+
+    expect(snapshot.helpSurface.discoveredFlags).toEqual(["--root"]);
+    expect(snapshot.helpSurface.flags).toBeUndefined();
+    expect(snapshot.subcommands.inspect.discoveredFlags).toEqual(["--json"]);
+    expect(snapshot.subcommands.inspect.flags).toBeUndefined();
+  });
+
+  it("preserves source and help baselines when only one scan surface refreshes", () => {
+    const prior = {
+      sources: [
+        {
+          url: "https://api.github.com/repos/example/tool/releases/latest",
+          sha256: "prior-source-hash",
+          semantic: { kind: "github-release.v1", sha256: "prior-semantic-hash" },
+        },
+      ],
+      helpSurface: { flags: ["--prior"] },
+      rootCommands: ["prior-command"],
+      subcommands: { inspect: { flags: ["--json"] } },
+    };
+
+    const helpOnly = buildSnapshotPayload("mistral", null, prior, {
+      available: true,
+      probedAt: "2026-07-13T00:00:00.000Z",
+      versionProbe: { installedVersion: "2.19.1", targetVersion: "2.19.1", matches: true },
+      discoveredFlags: ["--current"],
+      subcommands: {},
+    });
+    expect(helpOnly.sources).toEqual(prior.sources);
+    expect(helpOnly.helpSurface.discoveredFlags).toEqual(["--current"]);
+
+    const sourceOnly = buildSnapshotPayload(
+      "mistral",
+      [{ url: "https://example.test/release", sha256: "current-source-hash" }],
+      prior,
+      null
+    );
+    expect(sourceOnly.sources).toEqual([
+      { url: "https://example.test/release", sha256: "current-source-hash" },
+    ]);
+    expect(sourceOnly.helpSurface.discoveredFlags).toEqual(["--prior"]);
+    expect(sourceOnly.helpSurface.flags).toBeUndefined();
+    expect(sourceOnly.rootCommands).toEqual(["prior-command"]);
+    expect(sourceOnly.subcommands.inspect.discoveredFlags).toEqual(["--json"]);
+
+    const mixedRefresh = buildSnapshotPayload(
+      "mistral",
+      [
+        { url: prior.sources[0].url, ok: false, status: 0, sha256: null, error: "offline" },
+        { url: "https://example.test/current", ok: true, status: 200, sha256: "current" },
+      ],
+      prior,
+      null
+    );
+    expect(mixedRefresh.sources).toEqual([
+      prior.sources[0],
+      { url: "https://example.test/current", ok: true, status: 200, sha256: "current" },
+    ]);
+  });
+
+  it("includes installed version and root-command evidence in markdown reports", () => {
+    const report = renderReport(
+      "mistral",
+      {
+        upstream: "Mistral Vibe CLI",
+        executable: "vibe",
+        flags: {},
+        subcommands: {},
+        conformanceFixtures: [],
+      },
+      {
+        watchCategories: [],
+        sourceUrls: [],
+      },
+      null,
+      [],
+      {
+        available: true,
+        versionProbe: {
+          targetVersion: "vibe 2.19.1",
+          installedVersion: "vibe 2.19.1",
+          matches: true,
+        },
+        rootCommands: ["models"],
+        rootCatalogDrift: { added: [], removed: [] },
+        arityMismatches: [],
+        enumMismatches: [],
+        subcommands: {},
+      }
+    );
+
+    expect(report).toContain("Contract target version: `vibe 2.19.1`");
+    expect(report).toContain("Installed version: `vibe 2.19.1`");
+    expect(report).toContain("Version comparison: **matches**");
+    expect(report).toContain("Root commands discovered: **1**");
+  });
+});

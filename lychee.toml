@@ -1,0 +1,126 @@
+# lychee config — consumed by lycheeverse/lychee-action in
+# .github/workflows/security.yml at the "Link-rot scan" step.
+#
+# Scope: catch dead URLs in published docs (README.md, CHANGELOG.md,
+# docs/guides/BEST_PRACTICES.md, docs/personal-mcp/,
+# integrations/llm-plugin/README.md).
+# Skip generated, vendored, and historical surfaces.
+
+# Files / directories that lychee should NOT inspect.
+exclude_path = [
+  "node_modules",
+  "dist",
+  "integrations/llm-plugin/dist",
+  "integrations/llm-plugin/*.egg-info",
+  ".sqry",
+  ".sqry-cache",
+  ".claude",
+  ".worktrees",
+  # Historical / immutable artefacts — dead links here are evidence,
+  # not bugs.
+  "docs/archive",
+  "docs/reviews",
+  "DOGFOODING_RESULTS.md",
+  # supply-chain-guard ledger: per-dependency contracts plus verbatim captured
+  # upstream evidence (OSV records, npm registry documents, SLSA attestation
+  # bundles). Same reasoning as docs/reviews above, and stronger: these files
+  # are a point-in-time record of what an advisory said on the day a version
+  # was accepted. If one of those URLs later moves or dies, that is a fact
+  # about the upstream, not a defect in the record, and rewriting the record
+  # to chase it would destroy the thing it exists to preserve.
+  "docs/development/supply-chain-guard/ledger",
+]
+
+# URL patterns to skip. Each entry is a regex over the full URL.
+exclude = [
+  # localhost / loopback / private nets — never reachable from CI.
+  "^https?://(127\\.|localhost|10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.)",
+  # Example placeholders used in docs.
+  "^https?://example\\.(com|org|net)",
+  "^https?://your-domain\\.",
+  # GitHub URLs that require auth on private repos (we test the
+  # public mirror separately during release).
+  "^https://github\\.com/verivusai-labs/",
+  # This project's own Pages site. It is deployed only on a published
+  # stable release, so a page added by an unreleased change 404s here
+  # while being perfectly valid: every new site page would otherwise
+  # fail this gate until the release that publishes it.
+  # These URLs are NOT going unchecked, and are in fact checked more
+  # strictly than lychee can manage: scripts/validate-site-discovery.mjs
+  # (npm run site:validate, inside npm run check) sweeps every tracked file
+  # under site/ and docs/ (excluding the archived/reviews evidence dirs),
+  # extracts every llm-cli-gateway.dev self-link, and resolves each one
+  # against the LOCAL site/ tree, failing on a missing page and on a broken
+  # Markdown heading fragment. That covers non-route files (site/maintainers.md,
+  # site/robots.txt, site/index.html, docs/launch/) that the enumerated route
+  # list alone would miss, and it verifies the tree being merged, whereas
+  # probing the live domain only verifies whatever the last release deployed.
+  "^https://llm-cli-gateway\\.dev/",
+  # GitHub's unauthenticated REST API intermittently returns 403 to
+  # hosted Actions for public release metadata; upstream scans verify
+  # these advisory source URLs separately.
+  "^https://api\\.github\\.com/repos/[^/]+/[^/]+/releases/latest$",
+  # agent-assurance is a private verivus-oss repo today; lychee
+  # cannot auth into it from public CI. Re-evaluate when it's published.
+  # No trailing slash in the pattern so we match the bare repo URL too.
+  "^https://github\\.com/verivus-oss/agent-assurance(/|$)",
+  # gopenai.com serves 403 to non-browser clients. The link is a citation in
+  # docs/plans/native-compressor.research-annex.md and it resolves fine in a
+  # browser, so this is bot blocking rather than link rot. It has been dead to
+  # CI since it was added on 2026-07-08 and nobody saw it, because the
+  # self-hosted runners were failing 203/EXEC and this workflow had not
+  # completed a run since. Worth remembering that a green history can mean a
+  # gate that never ran.
+  "^https://blog\\.gopenai\\.com/",
+  # The Personal Agent Config Kit guide is linked from the site at its
+  # canonical location on the public mirror, but the mirror's main only
+  # receives repository content when a release is published, so it 404s
+  # until then. Scoped to this one path rather than the whole mirror,
+  # because unlike llm-cli-gateway.dev links there is no local validator
+  # covering github.com, so anything excluded here is genuinely
+  # unchecked. DELETE this entry once a release has published the file:
+  # it is a temporary bridge, and leaving it means a later rename of the
+  # guide would rot this link silently.
+  "^https://github\\.com/verivus-oss/llm-cli-gateway/blob/main/docs/guides/PERSONAL_AGENT_CONFIG_KIT\\.md$",
+  # PyPI / npm vanity URLs that 302 to authenticated dashboards.
+  "^https://platform\\.claude\\.com/manage",
+  "^https://pypi\\.org/manage/",
+  # npmjs.com rate-limits / 403s anonymous bot requests. The URLs are
+  # valid; lychee just can't reach them. Pattern catches both bare and
+  # www. variants.
+  "^https?://(www\\.)?npmjs\\.com/",
+  # Datasette's root intermittently resets anonymous CI connections.
+  # The link is stable and human-facing; do not fail the security gate
+  # on transient bot traffic handling.
+  "^https://datasette\\.io(/|$)",
+  # Socket's public package report repeatedly returns 503 to hosted CI. Keep
+  # the exclusion scoped to this package rather than hiding Socket links as a
+  # class.
+  "^https://socket\\.dev/npm/package/llm-cli-gateway$",
+  # Anthropic / OpenAI / Google docs occasionally rate-limit anon
+  # browsers. Their stability is not our gate; we re-verify the
+  # canonical URL during research steps.
+  "^https://docs\\.x\\.ai/",
+  # OpenAI's help center sits behind Cloudflare bot protection (403
+  # on anon GET). URLs are correct; verifying them is a human task.
+  "^https://help\\.openai\\.com/",
+]
+
+# Treat HTTP 429 (Too Many Requests) and 503 (Service Unavailable) as
+# transient — re-check rather than failing the build.
+accept = [200, 201, 202, 203, 204, 206, 301, 302, 303, 304, 307, 308, 429]
+
+# Network behaviour: short timeouts, modest concurrency to stay friendly
+# to upstream rate-limiters.
+timeout = 20
+max_concurrency = 8
+max_redirects = 5
+max_retries = 2
+retry_wait_time = 4
+
+# Identify ourselves so upstream operators can spot the traffic.
+user_agent = "llm-cli-gateway-lychee/1.0 (+https://github.com/verivus-oss/llm-cli-gateway)"
+
+# Don't follow base URL or anchor checks for offline files — paper-grade
+# rigour isn't needed for this repo's surface.
+include_fragments = false

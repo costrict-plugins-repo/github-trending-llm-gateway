@@ -1,0 +1,694 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>llm-cli-gateway - secure control plane for AI coding agents</title>
+    <meta
+      name="description"
+      content="Operate Claude Code, Codex, Gemini, Grok, Mistral Vibe, Devin, Cursor Agent, and API-provider LLMs from supported MCP clients while keeping execution workspace-scoped, approval-gated, durable, and auditable."
+    />
+    <link rel="canonical" href="https://llm-cli-gateway.dev/" />
+    <link rel="icon" href="/images/llmcligwlogov7-y-tm-64.png" />
+    <link rel="preload" as="image" href="/images/llmcligwlogov7-y-tm-64.webp" type="image/webp" />
+    <meta property="og:site_name" content="llm-cli-gateway" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Secure control plane for AI coding agents." />
+    <meta
+      property="og:description"
+      content="Use supported web, desktop, CLI, and remote MCP clients to operate local coding agents through one workspace-scoped, approval-gated, auditable gateway."
+    />
+    <meta property="og:url" content="https://llm-cli-gateway.dev/" />
+    <meta property="og:image" content="https://llm-cli-gateway.dev/images/social-card.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="llm-cli-gateway social preview" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Secure control plane for AI coding agents." />
+    <meta
+      name="twitter:description"
+      content="Operate local coding agents from supported MCP clients with workspace scoping, approval gates, durable jobs, sessions, and receipts."
+    />
+    <meta name="twitter:image" content="https://llm-cli-gateway.dev/images/social-card.png" />
+    <meta name="twitter:image:alt" content="llm-cli-gateway social preview" />
+    <link rel="alternate" type="text/markdown" href="/install.md" />
+    <link rel="alternate" type="text/markdown" href="/agents.md" />
+    <link rel="alternate" type="text/markdown" href="/tools.md" />
+    <link rel="alternate" type="text/plain" href="/llms.txt" />
+    <link rel="service-doc" type="text/markdown" href="/agents.md" title="Agent documentation" />
+    <link
+      rel="service-doc"
+      type="text/markdown"
+      href="/tools.md"
+      title="MCP tool API documentation"
+    />
+    <link rel="service-doc" type="text/plain" href="/llms.txt" title="LLM retrieval document" />
+    <link rel="service-doc" type="text/html" href="/docs" title="Developer documentation" />
+    <link rel="service-doc" type="text/html" href="/api" title="API reference" />
+    <link rel="service-doc" type="text/html" href="/developers" title="Developer portal" />
+    <link
+      rel="service-doc"
+      type="text/markdown"
+      href="/guides/coding-agent-gateway-technical-guide.md"
+      title="Coding-agent gateway technical guide"
+    />
+    <link
+      rel="service-desc"
+      type="application/vnd.oai.openapi+json"
+      href="/openapi.json"
+      title="OpenAPI description"
+    />
+    <link
+      rel="describedby"
+      type="application/json"
+      href="/.well-known/agent.json"
+      title="Agent metadata"
+    />
+    <link
+      rel="describedby"
+      type="application/linkset+json"
+      href="/.well-known/api-catalog"
+      title="API catalog"
+    />
+    <link
+      rel="service-desc"
+      type="application/json"
+      href="/.well-known/mcp/server-card.json"
+      title="MCP server card"
+    />
+    <link
+      rel="preload"
+      href="/fonts/syne-latin-400-800.woff2"
+      as="font"
+      type="font/woff2"
+      crossorigin
+    />
+    <link
+      rel="preload"
+      href="/fonts/outfit-latin-300-600.woff2"
+      as="font"
+      type="font/woff2"
+      crossorigin
+    />
+    <link
+      rel="preload"
+      href="/fonts/jetbrains-mono-latin-400-500.woff2"
+      as="font"
+      type="font/woff2"
+      crossorigin
+    />
+    <link rel="stylesheet" href="/css/fonts.css" />
+    <link rel="stylesheet" href="/style.css" />
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@graph": [
+          {
+            "@type": "Organization",
+            "@id": "https://verivus.com/#organization",
+            "name": "Verivus Pty Ltd",
+            "url": "https://verivus.com",
+            "sameAs": [
+              "https://github.com/verivus-oss",
+              "https://github.com/verivus-oss/llm-cli-gateway"
+            ]
+          },
+          {
+            "@type": "SoftwareApplication",
+            "@id": "https://llm-cli-gateway.dev/#software",
+            "name": "llm-cli-gateway",
+            "description": "Secure local control plane for operating Claude Code, Codex, Gemini/Antigravity, Grok Build, Mistral Vibe, Devin, Cursor Agent, and optional HTTP API providers from supported MCP clients while keeping execution workspace-scoped, approval-gated, durable, and auditable.",
+            "applicationCategory": "DeveloperApplication",
+            "operatingSystem": "Linux, macOS, Windows",
+            "url": "https://llm-cli-gateway.dev",
+            "downloadUrl": "https://www.npmjs.com/package/llm-cli-gateway",
+            "softwareVersion": "3.2.1",
+            "license": "https://opensource.org/licenses/MIT",
+            "sameAs": [
+              "https://github.com/verivus-oss/llm-cli-gateway",
+              "https://www.npmjs.com/package/llm-cli-gateway"
+            ],
+            "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+            "author": { "@id": "https://verivus.com/#organization" }
+          },
+          {
+            "@type": "WebAPI",
+            "@id": "https://llm-cli-gateway.dev/#api",
+            "name": "llm-cli-gateway MCP HTTP API",
+            "description": "Streamable HTTP MCP endpoint and tool catalog for llm-cli-gateway.",
+            "url": "https://llm-cli-gateway.dev/api",
+            "documentation": "https://llm-cli-gateway.dev/agents.md",
+            "provider": { "@id": "https://verivus.com/#organization" },
+            "isPartOf": { "@id": "https://llm-cli-gateway.dev/#software" }
+          }
+        ]
+      }
+    </script>
+  </head>
+  <body>
+    <a href="#main-content" class="skip-link">Skip to content</a>
+    <nav class="navbar" id="navbar">
+      <div class="navbar-inner">
+        <a href="/" class="navbar-logo" aria-label="llm-cli-gateway home">
+          <img src="/images/llmcligwlogov7-y-tm-64.webp" alt="" width="32" height="32" />
+          <span>llm-cli-gateway</span>
+        </a>
+        <button
+          type="button"
+          class="navbar-toggle"
+          id="nav-toggle"
+          aria-label="Toggle navigation"
+          aria-expanded="false"
+        >
+          <span></span><span></span><span></span>
+        </button>
+        <ul class="navbar-links" id="nav-links">
+          <li><a href="/install">Install</a></li>
+          <li><a href="/docs">Docs</a></li>
+          <li><a href="/api">API</a></li>
+          <li><a href="/developers">Developers</a></li>
+          <li>
+            <a href="https://github.com/verivus-oss/llm-cli-gateway#security-and-supply-chain"
+              >Security</a
+            >
+          </li>
+          <li><a href="/llms.txt">llms.txt</a></li>
+        </ul>
+        <div class="theme-toggle" role="group" aria-label="Color theme">
+          <button
+            type="button"
+            class="theme-toggle__option"
+            data-theme-choice="system"
+            aria-pressed="false"
+          >
+            System
+          </button>
+          <button
+            type="button"
+            class="theme-toggle__option"
+            data-theme-choice="dark"
+            aria-pressed="false"
+          >
+            Dark
+          </button>
+          <button
+            type="button"
+            class="theme-toggle__option"
+            data-theme-choice="light"
+            aria-pressed="false"
+          >
+            Light
+          </button>
+        </div>
+        <div class="navbar-cta">
+          <a
+            href="https://github.com/verivus-oss/llm-cli-gateway"
+            class="btn btn-outline"
+            target="_blank"
+            rel="noopener"
+            >GitHub</a
+          >
+        </div>
+      </div>
+    </nav>
+
+    <main id="main-content" class="hp-page hp-page--picking">
+      <section class="hp-hero-main" aria-labelledby="hp-main-title">
+        <div class="hp-hero-main__eyebrow">Secure local control plane for coding agents</div>
+        <h1 id="hp-main-title">Operate your AI coding agents from the clients you already use.</h1>
+        <p class="hp-hero-main__lede">
+          Give supported web, desktop, CLI, and remote MCP clients one user-owned gateway for Claude
+          Code, Codex, Gemini, Grok, Vibe, Devin, Cursor, and API-provider LLMs while keeping
+          execution workspace-scoped, approval-gated, durable, and auditable.
+        </p>
+        <div class="hp-hero-main__actions">
+          <a class="btn btn-primary" href="/install">Install</a>
+          <a class="btn btn-outline" href="https://github.com/verivus-oss/llm-cli-gateway"
+            >View GitHub</a
+          >
+        </div>
+        <div class="hp-hero-main__proof" aria-label="Primary capabilities">
+          <span>7 native CLI providers</span>
+          <span>API-token LLM routing</span>
+          <span>SQLite or Postgres jobs</span>
+          <span>Bearer or OAuth HTTP</span>
+        </div>
+        <div class="hp-hero-main__terminal" aria-label="Gateway usage example">
+          <div><span class="hp-term__prompt">&gt;</span> consensus_check({ models, claim })</div>
+          <div class="hp-term__muted">
+            claude_request: catches missing migration rollback<br />
+            codex_request: flags test gap in auth boundary<br />
+            gemini_request: suggests smaller deployment slice<br />
+            validation_receipt: durable evidence, retrievable after restart
+          </div>
+        </div>
+      </section>
+
+      <div class="hp-picker">
+        <div class="hp-picker__prompt">
+          <span class="hp-picker__dollar">$</span> llm-cli-gateway.dev --view &lt;TAB&gt;
+        </div>
+        <div class="hp-picker__options" role="group" aria-label="Choose a view">
+          <button type="button" class="hp-picker__option" data-variant="install">
+            <span class="hp-picker__option-name">install</span>
+            <span class="hp-picker__option-desc">Connect your first MCP client</span>
+          </button>
+          <button type="button" class="hp-picker__option" data-variant="demo">
+            <span class="hp-picker__option-name">demo</span>
+            <span class="hp-picker__option-desc">See the gateway running</span>
+          </button>
+          <button type="button" class="hp-picker__option" data-variant="compare">
+            <span class="hp-picker__option-name">compare</span>
+            <span class="hp-picker__option-desc">Why preserve native CLIs</span>
+          </button>
+        </div>
+        <span class="hp-picker__cursor" aria-hidden="true">&#9608;</span>
+      </div>
+
+      <section
+        class="hp-variant hp-variant--install hp-hero-install"
+        id="panel-install"
+        aria-label="Install view"
+      >
+        <div class="hp-product">
+          <img src="/images/llmcligwlogov7-y-tm-64.webp" alt="" width="32" height="32" />
+          <div>
+            <div class="hp-hero-install__name">
+              llm-cli-gateway - secure local control plane for AI coding agents
+            </div>
+            <div class="hp-hero-install__meta">
+              Claude / Codex / Gemini / Grok / Mistral / Devin / Cursor - durable async jobs - MIT
+            </div>
+          </div>
+        </div>
+
+        <div class="hp-hero-install__agent">
+          <div class="hp-hero-install__agent-label">Paste this into your AI agent:</div>
+          <div class="hp-hero-install__agent-block">
+            <code class="hp-hero-install__agent-prompt-line"
+              >Read https://llm-cli-gateway.dev/install.md and configure yourself to use
+              llm-cli-gateway as an MCP server.</code
+            >
+            <button
+              type="button"
+              class="hp-copy hp-copy--agent"
+              data-copy="Read https://llm-cli-gateway.dev/install.md and configure yourself to use llm-cli-gateway as an MCP server."
+              aria-label="Copy agent install prompt"
+            >
+              copy
+            </button>
+          </div>
+          <div class="hp-hero-install__agent-link">
+            <a href="/install.md">View the install spec</a>
+            <span class="hp-hero-install__agent-link-sep">·</span>
+            <a href="https://github.com/verivus-oss/llm-cli-gateway">Repository</a>
+          </div>
+        </div>
+
+        <div class="hp-hero-install__or">or run manually</div>
+        <div class="hp-hero-install__cmd">
+          <code>npx -y llm-cli-gateway</code>
+          <button
+            type="button"
+            class="hp-copy"
+            data-copy="npx -y llm-cli-gateway"
+            aria-label="Copy npx command"
+          >
+            copy
+          </button>
+        </div>
+      </section>
+
+      <section
+        class="hp-variant hp-variant--demo hp-hero-demo"
+        id="panel-demo"
+        aria-label="Demo view"
+      >
+        <div>
+          <span class="hp-hero-demo__prompt">$</span>
+          <span class="hp-hero-demo__cmd">npx -y llm-cli-gateway</span>
+        </div>
+        <div class="hp-hero-demo__success">&nbsp; MCP server connected over stdio</div>
+
+        <div class="hp-hero-demo__gap">
+          <span class="hp-hero-demo__prompt">$</span>
+          <span class="hp-hero-demo__cmd"
+            >LLM_GATEWAY_AUTH_TOKEN=… llm-cli-gateway --transport=http</span
+          >
+        </div>
+        <div class="hp-hero-demo__success">
+          &nbsp; HTTP MCP server listening on 127.0.0.1:3333/mcp (bearer or OAuth, per-principal
+          isolation)
+        </div>
+
+        <div class="hp-hero-demo__gap">
+          <span class="hp-hero-demo__prompt">&gt;</span>
+          <span class="hp-hero-demo__cmd"
+            >review_changes({ workingDir, models: ["claude", "codex", "gemini"] })</span
+          >
+        </div>
+        <div class="hp-hero-demo__output">
+          &nbsp; evidence.complete: true<br />&nbsp; artifact: committed + staged + unstaged +
+          untracked<br />&nbsp; result: one read-only job reference per reviewer
+        </div>
+
+        <div class="hp-hero-demo__gap">
+          <span class="hp-hero-demo__prompt">&gt;</span>
+          <span class="hp-hero-demo__cmd"
+            >claude_request_async({ prompt, outputFormat: "stream-json" })</span
+          >
+        </div>
+        <div class="hp-hero-demo__output">
+          &nbsp; jobId: 1f0c9a2e-…<br />&nbsp; status: running<br />&nbsp; persisted: SQLite by
+          default, Postgres when configured
+        </div>
+
+        <div class="hp-hero-demo__gap">
+          <span class="hp-hero-demo__prompt">&gt;</span>
+          <span class="hp-hero-demo__cmd">llm_job_watch({ jobId, afterProgressSeq })</span>
+        </div>
+        <div class="hp-hero-demo__output">
+          &nbsp; phase: tool<br />&nbsp; message: privacy-safe provider activity
+        </div>
+
+        <div class="hp-hero-demo__gap">
+          <span class="hp-hero-demo__prompt">&gt;</span>
+          <span class="hp-hero-demo__cmd">llm_job_result({ jobId })</span>
+        </div>
+        <div class="hp-hero-demo__success">
+          &nbsp; complete - result recovered after gateway restart
+        </div>
+      </section>
+
+      <section
+        class="hp-variant hp-variant--compare hp-hero-compare"
+        id="panel-compare"
+        aria-label="Compare view"
+      >
+        <div>
+          <div class="hp-hero-compare__col-label">API proxy</div>
+          <div class="hp-hero-compare__prompt">POST /v1/messages</div>
+          <div class="hp-hero-compare__output">
+            model response<br />
+            <span class="hp-hero-compare__output--dim">no native Claude Code session</span><br />
+            <span class="hp-hero-compare__output--dim">no Codex CLI resume</span><br />
+            <span class="hp-hero-compare__output--dim">no local provider CLI config</span><br />
+            <span class="hp-hero-compare__output--dim">file and test access must be rebuilt</span>
+          </div>
+          <div class="hp-hero-compare__summary">
+            Good for hosted chat. Thin for local coding agents.
+          </div>
+        </div>
+        <div>
+          <div class="hp-hero-compare__col-label">llm-cli-gateway</div>
+          <div class="hp-hero-compare__prompt">MCP tool call</div>
+          <div class="hp-hero-compare__output">
+            <span class="hp-hero-compare__output--accent">claude_request</span> keeps Claude Code
+            semantics<br />
+            <span class="hp-hero-compare__output--accent">codex_request</span> uses real Codex
+            sessions<br />
+            <span class="hp-hero-compare__output--accent">gemini_request</span> uses the installed
+            Antigravity CLI (agy)<br />
+            <span class="hp-hero-compare__output--accent">grok_request</span>,
+            <span class="hp-hero-compare__output--accent">mistral_request</span>,
+            <span class="hp-hero-compare__output--accent">devin_request</span>, and
+            <span class="hp-hero-compare__output--accent">cursor_request</span> follow provider CLIs
+          </div>
+          <div class="hp-hero-compare__summary">
+            One MCP surface, real local CLIs and configured API providers underneath.
+          </div>
+        </div>
+      </section>
+
+      <section class="hp-section">
+        <div class="hp-what">
+          <div class="hp-section__label">Why It Exists</div>
+          <p class="hp-what__desc">
+            Coding agents are strongest when they keep their native tools, credentials, and session
+            semantics. `llm-cli-gateway` puts Claude Code, Codex, Gemini/Antigravity, Grok Build,
+            Vibe, Devin, Cursor Agent, and API-provider LLMs behind one control plane without
+            flattening them into a generic chat proxy.
+          </p>
+          <p class="hp-what__desc hp-what__desc--secondary">
+            The practical payoff: supported clients can delegate work to local agents, scope remote
+            execution to registered workspaces, gate risky actions, survive disconnects, and
+            retrieve validation receipts after the gateway restarts.
+          </p>
+          <div class="hp-outcomes" aria-label="Product outcomes">
+            <div class="hp-outcome">
+              <h2>Review before you ship</h2>
+              <p>
+                Consensus, red-team, compare, and second-opinion tools turn model disagreement into
+                an artifact you can inspect.
+              </p>
+            </div>
+            <div class="hp-outcome">
+              <h2>Keep native agent behavior</h2>
+              <p>
+                Provider CLIs keep their auth stores, local file access, resume semantics, tool
+                execution, and model-specific controls.
+              </p>
+            </div>
+            <div class="hp-outcome">
+              <h2>Run it like infrastructure</h2>
+              <p>
+                Async jobs persist to SQLite by default or Postgres for service deployments, with
+                per-principal isolation over HTTP.
+              </p>
+            </div>
+            <div class="hp-outcome">
+              <h2>Add API models safely</h2>
+              <p>
+                OpenAI-compatible, Anthropic, and xAI-style providers read keys from named
+                environment variables at request time.
+              </p>
+            </div>
+          </div>
+          <div class="hp-what__queries">
+            <div class="hp-what__query">
+              <span class="hp-what__query-name">claude_request</span
+              ><span class="hp-what__query-desc"
+                >-> Claude Code with sessions and MCP server selection</span
+              >
+            </div>
+            <div class="hp-what__query">
+              <span class="hp-what__query-name">codex_request</span
+              ><span class="hp-what__query-desc">-> OpenAI Codex CLI with real resume IDs</span>
+            </div>
+            <div class="hp-what__query">
+              <span class="hp-what__query-name">*_request_async</span
+              ><span class="hp-what__query-desc"
+                >-> long-running jobs persisted to SQLite or Postgres</span
+              >
+            </div>
+            <div class="hp-what__query">
+              <span class="hp-what__query-name">review_changes</span
+              ><span class="hp-what__query-desc"
+                >-> complete hashed Git evidence for read-only model review</span
+              >
+            </div>
+            <div class="hp-what__query">
+              <span class="hp-what__query-name">session_create</span
+              ><span class="hp-what__query-desc"
+                >-> reusable provider sessions and worktree-aware flows</span
+              >
+            </div>
+            <div class="hp-what__query">
+              <span class="hp-what__query-name">approval_list</span
+              ><span class="hp-what__query-desc">-> review approval decisions from one place</span>
+            </div>
+          </div>
+          <p class="hp-what__closer">
+            The gateway orchestrates local CLIs and configured API providers. It does not replace
+            them.
+          </p>
+        </div>
+      </section>
+
+      <section class="hp-section">
+        <div class="hp-section__label">Posture</div>
+        <div class="hp-assurance" aria-label="Quality, security, and provenance indicators">
+          <a
+            href="https://github.com/verivus-oss/llm-cli-gateway/actions/workflows/ci.yml"
+            class="hp-assurance__item"
+            >CI</a
+          >
+          <a
+            href="https://github.com/verivus-oss/llm-cli-gateway/actions/workflows/security.yml"
+            class="hp-assurance__item"
+            >Security</a
+          >
+          <a
+            href="https://github.com/verivus-oss/llm-cli-gateway/actions/workflows/sast.yml"
+            class="hp-assurance__item"
+            >SAST</a
+          >
+          <a
+            href="https://scorecard.dev/viewer/?uri=github.com/verivus-oss/llm-cli-gateway"
+            class="hp-assurance__item"
+            >OpenSSF Scorecard</a
+          >
+          <a href="https://www.bestpractices.dev/projects/13025" class="hp-assurance__item"
+            >OpenSSF Best Practices</a
+          >
+          <a href="https://www.npmjs.com/package/llm-cli-gateway" class="hp-assurance__item"
+            >npm package</a
+          >
+          <a
+            href="https://github.com/verivus-oss/llm-cli-gateway/blob/main/SECURITY.md#release-signing"
+            class="hp-assurance__item"
+            >Sigstore</a
+          >
+          <a
+            href="https://github.com/verivus-oss/llm-cli-gateway/blob/main/.github/CODEOWNERS"
+            class="hp-assurance__item"
+            >CODEOWNERS</a
+          >
+          <a
+            href="https://github.com/verivus-oss/llm-cli-gateway/blob/main/.github/dependabot.yml"
+            class="hp-assurance__item"
+            >Dependabot</a
+          >
+          <a
+            href="https://github.com/verivus-oss/llm-cli-gateway/blob/main/LICENSE"
+            class="hp-assurance__item"
+            >MIT</a
+          >
+        </div>
+        <table class="hp-bench">
+          <thead>
+            <tr>
+              <th>Signal</th>
+              <th>Status</th>
+              <th>Why it matters</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Runtime</td>
+              <td>local stdio or remote HTTP</td>
+              <td>run on your machine, or expose it behind a bearer token or OAuth</td>
+            </tr>
+            <tr>
+              <td>Remote auth</td>
+              <td>bearer or built-in OAuth 2.0</td>
+              <td>PKCE, opt-in consent gate, per-principal isolation, fail-closed posture</td>
+            </tr>
+            <tr>
+              <td>Async jobs</td>
+              <td>SQLite default, Postgres optional</td>
+              <td>long calls can survive gateway restarts</td>
+            </tr>
+            <tr>
+              <td>Validation</td>
+              <td>cross-model tools</td>
+              <td>compare, red-team, second opinion, and consensus workflows</td>
+            </tr>
+            <tr>
+              <td>Release</td>
+              <td>audited npm package + Sigstore installers</td>
+              <td>published artifacts have supply-chain controls</td>
+            </tr>
+            <tr>
+              <td>License</td>
+              <td>MIT</td>
+              <td>open source and installable without a hosted service</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="hp-section hp-section--tight">
+        <div class="hp-section__label">Integration</div>
+        <div class="hp-integration">
+          <div class="hp-integration__row">
+            <span class="hp-integration__label">MCP clients</span
+            ><span class="hp-integration__cmd"
+              ><a href="/install.md">npx -y llm-cli-gateway</a></span
+            ><span class="hp-integration__desc"
+              >stdio server for local MCP clients (or <code>--transport=http</code> for remote
+              clients)</span
+            >
+          </div>
+          <div class="hp-integration__row">
+            <span class="hp-integration__label">Providers</span
+            ><span class="hp-integration__cmd"
+              >claude / codex / agy / grok / vibe / devin / cursor-agent / api_*</span
+            ><span class="hp-integration__desc"
+              >uses installed CLI credentials or API keys from named environment variables</span
+            >
+          </div>
+          <div class="hp-integration__row">
+            <span class="hp-integration__label">Registry</span
+            ><span class="hp-integration__cmd">io.github.verivus-oss/llm-cli-gateway</span
+            ><span class="hp-integration__desc">published to the official MCP Registry</span>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <div class="footer-inner">
+        <div>
+          <div class="footer-brand">
+            <img src="/images/llmcligwlogov7-y-tm-64.webp" alt="llm-cli-gateway" height="24" />
+          </div>
+          <div class="footer-tagline">
+            Secure local control plane for AI coding agents.<br />Open source. Built by Verivus.
+          </div>
+        </div>
+        <div class="footer-links">
+          <div class="footer-col">
+            <h3>Product</h3>
+            <ul>
+              <li><a href="/install">Install</a></li>
+              <li><a href="/docs">Docs</a></li>
+              <li><a href="/developers">Developers</a></li>
+              <li><a href="/guides/coding-agent-gateway-technical-guide.md">Technical guide</a></li>
+              <li><a href="/agents.md">Agent guide</a></li>
+              <li><a href="/tools.md">Tools</a></li>
+              <li>
+                <a href="https://github.com/verivus-oss/llm-cli-gateway#configuration"
+                  >Configuration</a
+                >
+              </li>
+            </ul>
+          </div>
+          <div class="footer-col">
+            <h3>Reference</h3>
+            <ul>
+              <li><a href="/llms.txt">llms.txt</a></li>
+              <li><a href="/api">API reference</a></li>
+              <li><a href="/openapi.json">OpenAPI</a></li>
+              <li><a href="/workflows/cross-model-review.md">Workflow demo</a></li>
+              <li><a href="/DISCOVERY.md">Discovery</a></li>
+              <li><a href="/.well-known/api-catalog">API catalog</a></li>
+              <li><a href="/.well-known/mcp/server-card.json">MCP server card</a></li>
+              <li><a href="/.well-known/integrations.json">integrations.json</a></li>
+              <li><a href="/maintainers.md">Maintainers</a></li>
+              <li><a href="/sitemap.md">Sitemap</a></li>
+              <li><a href="/.well-known/agent.json">agent.json</a></li>
+            </ul>
+          </div>
+          <div class="footer-col">
+            <h3>Company</h3>
+            <ul>
+              <li><a href="https://github.com/verivus-oss/llm-cli-gateway">GitHub</a></li>
+              <li><a href="https://www.npmjs.com/package/llm-cli-gateway">npm</a></li>
+              <li><a href="/about">About</a></li>
+              <li><a href="/contact">Contact</a></li>
+              <li><a href="/privacy">Privacy</a></li>
+              <li><a href="https://verivus.com">Verivus</a></li>
+            </ul>
+          </div>
+        </div>
+      </div>
+      <div class="footer-bottom">
+        <span>© 2026 Verivus Pty Ltd</span><span>llm-cli-gateway v3.2.1</span>
+      </div>
+    </footer>
+    <div id="copy-announce" aria-live="polite" class="sr-only"></div>
+    <script src="/js/theme.js" defer></script>
+    <script src="/js/homepage.js" defer></script>
+  </body>
+</html>

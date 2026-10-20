@@ -1,0 +1,2247 @@
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { homedir, platform, arch, release } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { loadAuthConfig } from "./auth.js";
+import {
+  createEndpointExposureReport,
+  redactDiagnosticUrl,
+  type EndpointExposureReport,
+} from "./endpoint-exposure.js";
+import {
+  getApiProviderStatus,
+  listProviderRuntimeStatuses,
+  type ProviderLoginStatus,
+  type ProviderRuntimeStatus,
+} from "./provider-status.js";
+import {
+  getApiProviderLoginGuidance,
+  type ApiProviderLoginGuidance,
+} from "./provider-login-guidance.js";
+import { CLAUDE_MCP_SERVER_NAMES } from "./claude-mcp-config.js";
+import {
+  defaultLeastCostConfig,
+  diagnoseRemoteOAuthConfig,
+  enabledApiProviders,
+  loadCacheAwarenessConfig,
+  loadLeastCostConfig,
+  loadPersistenceConfig,
+  loadProvidersConfig,
+  type CacheAwarenessConfig,
+  type LeastCostConfig,
+  type PersistenceConfig,
+  type ProvidersConfig,
+  type RemoteOAuthConfigDiagnostics,
+} from "./config.js";
+import {
+  persistenceRetentionPolicy,
+  unboundedRetentionSubsystems,
+  type RetentionSubsystemId,
+} from "./storage/retention.js";
+import { telemetryTierFor, type TelemetryTier } from "./lcr-telemetry.js";
+import { API_CATALOG_AS_OF, PRICING_AS_OF, getModelCost, modelIdToFamily } from "./pricing.js";
+import { computeLcrPriorsFromDb } from "./lcr-priors.js";
+import type { LcrPriors } from "./lcr-priors.js";
+import { getCliInfo } from "./model-registry.js";
+import type { Confidence, PriceSource, QualityTier } from "./least-cost-types.js";
+import type { AuthConfig } from "./auth.js";
+import {
+  loadWorkspaceRegistry,
+  remoteSafeWorkspaceSummary,
+  type RemoteSafeWorkspaceSummary,
+} from "./workspace-registry.js";
+import { buildRemoteConnectorUrls, resolveConfiguredRemoteOrigin } from "./remote-url.js";
+import { computeGlobalCacheStats } from "./cache-stats.js";
+import type { GlobalCacheStats } from "./cache-stats.js";
+import {
+  FlightRecorder,
+  flightRecorderHealth,
+  flightRecorderHealthMessage,
+  createFlightRecorder,
+  flightRecorderDisabled,
+  flightRecorderReadsAreAuthoritative,
+  resolveFlightRecorderDbPath,
+  type CoResidentTableStats,
+  type FlightRecorderLike,
+  type FlightRecorderState,
+} from "./flight-recorder.js";
+import { postgresFailureMessage } from "./storage/postgres-diagnostics.js";
+import {
+  buildUpstreamContractReport,
+  type InstalledCliContractProbe,
+} from "./upstream-contracts.js";
+import { compareInstalledToTargets, summarizeVersionGuard } from "./provider-version-guard.js";
+import {
+  getProviderToolCapabilities,
+  knownProviderCapabilityIds,
+  type ProviderCapabilityId,
+  type ProviderKind,
+} from "./provider-tool-capabilities.js";
+import {
+  loadPersonalConfigSettings,
+  PersonalConfigManager,
+  PERSONAL_CONFIG_SYNC_ERROR_WITHHELD,
+  type PersonalConfigStatus,
+} from "./personal-config.js";
+import { CLI_TYPES, type CliType } from "./session-manager.js";
+import {
+  getProviderPersonalConfigKit,
+  getKitProviderLabel,
+  type KitIsolationModel,
+} from "./provider-definitions.js";
+
+/**
+ * Slice 3 cross-cutting: doctor report block summarising the gateway's
+ * cache-awareness posture. Always PRESENT in the report (zeroed when the
+ * flight recorder has no rows for the last 24h).
+ *
+ * `enabled_features` is an empty array (NOT omitted) when all flags are
+ * off so callers can distinguish "configured but dormant" from
+ * "cache_awareness block missing".
+ */
+export interface CacheAwarenessReport {
+  enabled_features: Array<"anthropic_cache_control" | "ttl_warnings">;
+  last_24h: {
+    hit_rate: number;
+    total_hits: number;
+    total_requests: number;
+    estimated_savings_usd: number;
+  };
+  per_cli: Partial<
+    Record<
+      CliType,
+      {
+        hit_rate: number;
+        total_hits: number;
+        total_cache_read_tokens: number;
+      }
+    >
+  >;
+}
+
+export interface ProviderCapabilitySummaryReport {
+  schema_version: "provider-tool-capabilities.v2";
+  tool: "provider_tool_capabilities";
+  resources: {
+    catalog: "provider-tools://catalog";
+    providers: Record<ProviderCapabilityId, string>;
+  };
+  cache_ttl_ms: number;
+  providers: Record<
+    ProviderCapabilityId,
+    {
+      provider_kind: ProviderKind;
+      cli_available: boolean;
+      gateway_request_tools: string[];
+      supported_features: string[];
+      unsupported_inputs: string[];
+      config_surface_count: number;
+      discovered_skill_count: number;
+      discovered_provider_tool_count: number;
+      warnings: string[];
+    }
+  >;
+}
+
+/**
+ * Slice 6: per-API-provider health entry. Reports key presence + endpoint
+ * shape; never the key value. `reachable` stays null unless the opt-in
+ * `--probe-api-providers` reachability probe ran.
+ */
+export interface ApiProviderHealthEntry {
+  name: string;
+  kind: "openai-compatible" | "anthropic" | "xai-responses";
+  base_url: string;
+  default_model: string;
+  models: string[] | null;
+  /** The env var the key is read from, or null for a keyless-local provider. */
+  api_key_env: string | null;
+  /** Whether the configured key env var resolves to a non-empty value. */
+  api_key_present: boolean;
+  /** null = not probed; true/false = opt-in reachability probe result. */
+  reachable: boolean | null;
+  /** Set only when a reachability probe ran and failed. */
+  reachability_error?: string;
+  /** How to obtain/configure the key for this provider (no secret material). */
+  login_guidance: ApiProviderLoginGuidance;
+}
+
+export interface ApiProviderHealthReport {
+  enabled_count: number;
+  providers: Record<string, ApiProviderHealthEntry>;
+}
+
+export interface VibeSessionLoggingStatus {
+  config_path: string;
+  config_present: boolean;
+  session_logging_enabled: boolean;
+  note: string;
+  /**
+   * How this ambient setting relates to a Mistral Kit turn. A Kit turn runs
+   * under a redirected VIBE_HOME with a gateway-written config, so this file is
+   * never read there: it can neither enable nor block Kit native continuity.
+   */
+  kit_note: string;
+}
+
+/**
+ * Stated once so the doctor surface cannot drift from the isolation module's
+ * actual behaviour (`buildKitVibeConfigToml` writes `[session_logging] enabled
+ * = true` plus a gateway-owned `save_dir` into the redirected home).
+ */
+const VIBE_KIT_SESSION_LOGGING_NOTE =
+  "Personal Agent Config Kit mistral turns do not read this file: they run under a redirected VIBE_HOME whose gateway-written config always enables session logging and points save_dir at a gateway-owned directory. This setting affects non-Kit mistral_request --continue / --resume only.";
+
+export interface GeminiConfigStatus {
+  /** Presence of a project-local `GEMINI.md` in the gateway's cwd. */
+  project_gemini_md_present: boolean;
+  project_gemini_md_path: string;
+  /** Presence of `~/.gemini/GEMINI.md`. */
+  user_gemini_md_present: boolean;
+  user_gemini_md_path: string;
+  /** Presence and contents of `~/.gemini/settings.json` `mcpServers` block. */
+  settings_json_present: boolean;
+  settings_json_path: string;
+  mcp_servers_registered: string[];
+  /** Per-server reconciliation against the gateway's `--allowed-mcp-server-names` whitelist. */
+  mcp_reconciliation: {
+    whitelisted: string[];
+    missing_from_settings: string[];
+  };
+  next_actions: string[];
+}
+
+/**
+ * Probe ~/.vibe/config.toml to see whether session_logging is enabled. Current
+ * Mistral Vibe defaults session logging to enabled; an explicit
+ * `[session_logging] enabled = false` disables `--continue` / `--resume`.
+ * The probe is read-only: the gateway never mutates this file.
+ */
+export function checkVibeSessionLogging(home = homedir()): VibeSessionLoggingStatus {
+  const configPath = join(home, ".vibe", "config.toml");
+  if (!existsSync(configPath)) {
+    return {
+      config_path: configPath,
+      config_present: false,
+      session_logging_enabled: true,
+      kit_note: VIBE_KIT_SESSION_LOGGING_NOTE,
+      note: "~/.vibe/config.toml not found; current Vibe defaults session_logging.enabled to true. If resume fails, create ~/.vibe/config.toml with [session_logging]\\nenabled = true.",
+    };
+  }
+  try {
+    const text = readFileSync(configPath, "utf8");
+    const enabled = parseVibeSessionLoggingEnabled(text);
+    if (enabled !== false) {
+      return {
+        config_path: configPath,
+        config_present: true,
+        session_logging_enabled: true,
+        kit_note: VIBE_KIT_SESSION_LOGGING_NOTE,
+        note:
+          enabled === true
+            ? "session_logging.enabled is true; --continue/--resume will work for mistral_request."
+            : "session_logging.enabled is not set; current Vibe defaults it to true.",
+      };
+    }
+    return {
+      config_path: configPath,
+      config_present: true,
+      session_logging_enabled: false,
+      kit_note: VIBE_KIT_SESSION_LOGGING_NOTE,
+      note: "[session_logging] enabled = false. Edit ~/.vibe/config.toml so the [session_logging] block sets enabled = true before using mistral_request --resume / --continue.",
+    };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      config_path: configPath,
+      config_present: true,
+      session_logging_enabled: false,
+      kit_note: VIBE_KIT_SESSION_LOGGING_NOTE,
+      note: `Could not parse ~/.vibe/config.toml: ${message}. Verify the file is valid TOML.`,
+    };
+  }
+}
+
+/**
+ * Tiny TOML probe focused on `[session_logging] enabled = ...`. Avoids pulling
+ * in the full `toml` parser when only one boolean is needed.
+ */
+function parseVibeSessionLoggingEnabled(text: string): boolean | undefined {
+  const lines = text.split(/\r?\n/);
+  let inSection = false;
+  for (const raw of lines) {
+    const line = raw.replace(/#.*$/, "").trim();
+    if (!line) continue;
+    const sectionMatch = line.match(/^\[\s*([A-Za-z0-9_.-]+)\s*\]$/);
+    if (sectionMatch) {
+      inSection = sectionMatch[1] === "session_logging";
+      continue;
+    }
+    if (inSection) {
+      const kv = line.match(/^enabled\s*=\s*(.+)$/);
+      if (kv) {
+        const value = kv[1].trim().toLowerCase();
+        if (value === "true") return true;
+        if (value === "false") return false;
+        return undefined;
+      }
+    } else {
+      // Allow dotted form: session_logging.enabled = true
+      const dotted = line.match(/^session_logging\.enabled\s*=\s*(.+)$/);
+      if (dotted) {
+        const value = dotted[1].trim().toLowerCase();
+        if (value === "true") return true;
+        if (value === "false") return false;
+        return undefined;
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * U27: Probe Gemini's project/user config locations.
+ *
+ * - `./GEMINI.md` (gateway cwd) and `~/.gemini/GEMINI.md` are documented
+ *   "context" surfaces. Missing both means Gemini has no project-specific
+ *   guidance.
+ * - `~/.gemini/settings.json` defines registered MCP servers (`mcpServers`
+ *   block). The gateway tracks its own whitelist (`CLAUDE_MCP_SERVER_NAMES`)
+ *   and surfaces a reconciliation warning for each whitelisted server not
+ *   present in settings.json so callers don't ship requests for unregistered
+ *   servers.
+ */
+export function checkGeminiConfig(
+  cwd: string = process.cwd(),
+  home: string = homedir(),
+  whitelist: readonly string[] = CLAUDE_MCP_SERVER_NAMES
+): GeminiConfigStatus {
+  const projectGeminiMd = join(cwd, "GEMINI.md");
+  const userGeminiMd = join(home, ".gemini", "GEMINI.md");
+  const settingsPath = join(home, ".gemini", "settings.json");
+
+  const projectGeminiMdPresent = existsSync(projectGeminiMd);
+  const userGeminiMdPresent = existsSync(userGeminiMd);
+  const settingsPresent = existsSync(settingsPath);
+
+  let mcpServersRegistered: string[] = [];
+  if (settingsPresent) {
+    try {
+      const raw = readFileSync(settingsPath, "utf8");
+      const parsed = JSON.parse(raw) as { mcpServers?: Record<string, unknown> };
+      if (parsed && typeof parsed.mcpServers === "object" && parsed.mcpServers) {
+        mcpServersRegistered = Object.keys(parsed.mcpServers);
+      }
+    } catch {
+      // Best-effort: leave list empty so the next_action surfaces the gap.
+    }
+  }
+
+  const missingFromSettings = whitelist.filter(name => !mcpServersRegistered.includes(name));
+
+  const nextActions: string[] = [];
+  if (!projectGeminiMdPresent && !userGeminiMdPresent) {
+    nextActions.push(
+      `Create ${projectGeminiMd} to give Gemini project-specific context (or ${userGeminiMd} for a user-wide default).`
+    );
+  }
+  if (!settingsPresent) {
+    nextActions.push(
+      `Create ${settingsPath} to register MCP servers (mcpServers block). Run \`gemini mcp add <name>\` for each gateway-whitelisted server.`
+    );
+  }
+  for (const name of missingFromSettings) {
+    nextActions.push(
+      `MCP server \`${name}\` is whitelisted by the gateway but not registered in ${settingsPath}. Run \`gemini mcp add ${name}\` to register it.`
+    );
+  }
+
+  return {
+    project_gemini_md_present: projectGeminiMdPresent,
+    project_gemini_md_path: projectGeminiMd,
+    user_gemini_md_present: userGeminiMdPresent,
+    user_gemini_md_path: userGeminiMd,
+    settings_json_present: settingsPresent,
+    settings_json_path: settingsPath,
+    mcp_servers_registered: mcpServersRegistered,
+    mcp_reconciliation: {
+      whitelisted: [...whitelist],
+      missing_from_settings: missingFromSettings,
+    },
+    next_actions: nextActions,
+  };
+}
+
+/**
+ * LCR phase_3 (DAG step `doctor-eligibility`, `[observability].doctor`):
+ * economics-only eligibility summary for least-cost routing. Prompt-free and
+ * secret-free by construction: it carries only model names, resolved pricing
+ * families, price provenance, capability tiers, telemetry tiers, price-table
+ * staleness, and anonymized (content-type, family) calibration buckets. No raw
+ * prompts, no secrets, no base_url userinfo, no principal.
+ *
+ * ALWAYS present in the report. When `[least_cost].enabled` is false the block
+ * is compact: `enabled:false` plus `pricing` (so operators still see staleness)
+ * and empty `providers` / `untieredModels` / `calibrationQuality` arrays. The
+ * block never spawns a CLI; per-candidate eligibility (priced / tiered /
+ * telemetry) needs no provider process.
+ */
+export interface LeastCostCandidateReport {
+  /** CLI-brand model id / alias from the model registry (getCliInfo). */
+  model: string;
+  /** Resolved pricing family (modelIdToFamily), CLI-agnostic. */
+  family: string;
+  /** True when getModelCost resolved a price (source !== "unknown"). */
+  priced: boolean;
+  /** Price provenance: "table", "api-catalog", or "unknown". */
+  priceSource: PriceSource;
+  /** Capability tier from LeastCostConfig.tiers[`provider:family`], or null (UNTIERED). */
+  tier: QualityTier | null;
+}
+
+export interface LeastCostProviderReport {
+  provider: CliType;
+  /** Per-provider telemetry tier T1-T4 (telemetryTierFor). */
+  telemetryTier: TelemetryTier;
+  candidates: LeastCostCandidateReport[];
+}
+
+/** One anonymized (content-type, family) calibration bucket (spec 4.2 enh 5). */
+export interface LeastCostCalibrationBucketReport {
+  /** Bucket key `"<content-type>:<family>"`. */
+  bucket: string;
+  /** Learned input-token calibration factor `k = median(actual/base)`. */
+  k: number;
+  samples: number;
+  /** Advisory confidence label derived from calibration quality. */
+  confidence: Confidence;
+}
+
+export interface LeastCostReport {
+  enabled: boolean;
+  pricing: {
+    /** CLI family price table timestamp (PRICING_AS_OF). */
+    tableAsOf: string;
+    /** Published API-catalog refresh timestamp (API_CATALOG_AS_OF). */
+    apiCatalogAsOf: string;
+    /** Whole days since the NEWER of the two asOf dates vs the doctor run date (>= 0). */
+    staleDays: number;
+  };
+  /** Per-CLI-provider eligibility candidates. Empty when routing is disabled. */
+  providers: LeastCostProviderReport[];
+  /** `"<provider>:<model>"` for every candidate whose tier is null. */
+  untieredModels: string[];
+  /** Per-bucket calibration quality. Empty when disabled / no learning data. */
+  calibrationQuality: LeastCostCalibrationBucketReport[];
+}
+
+/**
+ * Read-only Personal Agent Config Kit readiness. This is intentionally a
+ * narrow projection: it never includes baseline paths, configuration source
+ * paths, remote URLs, or raw synchronization diagnostics.
+ *
+ * `durable_async_configured` describes resolved configuration only. It does
+ * not claim that a running gateway currently has a healthy durable store.
+ */
+/**
+ * Per-provider Kit eligibility. `kit_supported` is a static registry fact
+ * (`personalConfigKit.supported`); `eligible` additionally requires the Kit to
+ * be enabled with a valid configuration and every provider-specific
+ * precondition met. `blockers` names the unmet preconditions in operator terms
+ * and never carries a credential value or a local path.
+ */
+export interface ProviderKitEligibility {
+  kit_supported: boolean;
+  eligible: boolean;
+  /** How ambient provider configuration is neutralised, or null when unsupported. */
+  isolation_model: KitIsolationModel;
+  /** Env var name (never its value) the Kit requires, or null when none. */
+  required_credential_env: string | null;
+  /**
+   * Whether `required_credential_env` resolves to a non-empty value in the
+   * gateway process. Always false when `required_credential_env` is null: there
+   * is no such variable, not a satisfied requirement.
+   */
+  required_credential_configured: boolean;
+  blockers: string[];
+}
+
+export interface PersonalConfigReadinessReport {
+  enabled: boolean;
+  configuration_valid: boolean;
+  /**
+   * Legacy aggregate readiness. Unchanged since the Claude/Codex-only Kit: it
+   * still requires the Claude `--bare` credential, so it reports readiness for
+   * a Claude Kit turn specifically. Read `provider_eligibility` for the truth
+   * about any individual provider.
+   */
+  ready: boolean;
+  /** Whether Claude Kit's isolated --bare mode has its required API credential. */
+  claude_bare_auth_configured: boolean;
+  baseline_present: boolean;
+  current_release_id: string | null;
+  last_success_at: string | null;
+  stale: boolean;
+  last_sync_error: string | null;
+  durable_async_configured: boolean;
+  /** Kit eligibility for every provider, keyed by CliType. Always complete. */
+  provider_eligibility: Record<CliType, ProviderKitEligibility>;
+}
+
+export interface PersonalConfigReadinessInput {
+  enabled: boolean;
+  configurationValid?: boolean;
+  /** Secret-free presence signal for ANTHROPIC_API_KEY in the gateway process. */
+  claudeBareAuthConfigured?: boolean;
+  /**
+   * Secret-free presence signals for each provider's required Kit credential
+   * env var, keyed by env var NAME (e.g. `MISTRAL_API_KEY`). Absent keys are
+   * treated as not configured.
+   */
+  credentialEnvConfigured?: Record<string, boolean>;
+  status?: Pick<
+    PersonalConfigStatus,
+    "baselinePresent" | "currentReleaseId" | "lastSuccessAt" | "stale" | "lastSyncError"
+  >;
+  persistence?: Pick<PersistenceConfig, "backend" | "asyncJobsEnabled"> | null;
+}
+
+/**
+ * Storage health, which `doctor --json` reported NOTHING of.
+ *
+ * It opened the flight recorder inside a swallowing try/catch, ran two reads
+ * inside two more, and then emitted a normal zero-valued `cache_awareness`
+ * block either way. So a corrupt, unreadable or full transcript database
+ * produced a report indistinguishable from a quiet one.
+ */
+export interface StorageHealthReport {
+  /**
+   * FALSE when nobody performed the asynchronous scan, which is the case for
+   * every synchronous caller of `createDoctorReport`. Distinguished from a scan
+   * that ran and found nothing, because that distinction is the whole subject.
+   */
+  scanned: boolean;
+  flight_recorder: {
+    /** NULL when `scanned` is false. Nothing was observed, so nothing is claimed. */
+    state: FlightRecorderState | null;
+    path: string | null;
+    /** True only when an empty read here means "nothing was recorded". */
+    reads_are_authoritative: boolean;
+    error: string | null;
+    /** Null means not measured, never "zero bytes". */
+    file_bytes: number | null;
+    wal_bytes: number | null;
+    schema_version: number | null;
+    request_rows: number | null;
+    oldest_request: string | null;
+    newest_request: string | null;
+  };
+  job_store: {
+    backend: string;
+    path: string | null;
+    /** The job store and the transcript are in the SAME SQLite file. */
+    shares_flight_recorder_file: boolean;
+  };
+  retention: {
+    /** The job store's bound. Kept under its old name and old meaning. */
+    days: number | null;
+    /**
+     * Subsystems the resolved policy does not bound, DERIVED from it. It was a
+     * hard-coded `["requests"]`, which is the second place a retention decision
+     * was being taken.
+     */
+    unbounded: string[];
+    /** Days per subsystem, or null where nothing deletes. The dry-run's basis. */
+    policy: Record<string, number | null> | null;
+    /** What a `requests` sweep would delete right now. Counted, never deleted. */
+    requests_beyond_retention: number | null;
+    /**
+     * Bytes a compaction would return to the filesystem. SQLite only: a DELETE
+     * frees pages onto a freelist and never shrinks the file, so retention
+     * alone leaves a 1.2 GB file at 1.2 GB.
+     */
+    reclaimable_bytes: number | null;
+  };
+  /**
+   * Tables in the recorder's file belonging to other subsystems, with their
+   * non-terminal row counts. On a host switched to Postgres this is the
+   * abandoned copy that still answers queries as though it were live.
+   */
+  co_resident: Array<{ table: string; rows: number; unfinished: number; live: boolean }>;
+  warnings: string[];
+}
+
+export interface DoctorReport {
+  schema_version: "1.2";
+  ok: boolean;
+  storage: StorageHealthReport;
+  generated_at: string;
+  system: {
+    os: NodeJS.Platform;
+    arch: string;
+    release: string;
+    node_version: string;
+  };
+  gateway: {
+    name: string;
+    version: string;
+  };
+  transport: {
+    default: "stdio" | "http";
+    http: {
+      enabled: boolean;
+      host: string;
+      port: number;
+      path: string;
+      public_url_configured: boolean;
+      public_url: string | null;
+      chatgpt_connector_url: string | null;
+    };
+  };
+  auth: {
+    required: boolean;
+    token_configured: boolean;
+    source: string;
+    oauth: {
+      enabled: boolean;
+      registration_policy: string;
+      clients_configured: number;
+      shared_secret_enabled: boolean;
+      pkce_required: boolean;
+      issuer: string | null;
+    };
+  };
+  workspaces: {
+    enabled: boolean;
+    default: string | null;
+    repo_count: number;
+    allowed_root_count: number;
+    gateway_app_dir_is_workspace: boolean;
+  };
+  providers: Record<
+    CliType,
+    {
+      cli_available: boolean;
+      version: string | null;
+      login_status: ProviderLoginStatus;
+      version_command: string[];
+      login_check: {
+        method: "cli" | "credential_store" | "not_checked";
+        command: string[] | null;
+        credential_store: "present" | "not_found" | "not_checked";
+        detail: string;
+      };
+      install_guidance: {
+        summary: string;
+        commands: string[];
+        documentation_url?: string;
+      };
+      login_guidance: {
+        summary: string;
+        commands: string[];
+        credential_handling: string;
+      };
+    }
+  >;
+  endpoint_exposure: EndpointExposureReport;
+  /**
+   * Stable readiness projection for the preferred remote connector path
+   * (public HTTPS URL + /mcp + OAuth + registered/default workspace). Combines
+   * endpoint-exposure, OAuth config, OAuth metadata URLs, client registration,
+   * and workspace readiness into an ordered decision tree so an operator or
+   * setup assistant sees the single next blocking action. Contains no secrets.
+   */
+  remote_http_oauth: RemoteHttpOAuthReadiness;
+  client_config: {
+    claude_desktop_config_present: boolean;
+    codex_config_present: boolean;
+    gemini_settings_present: boolean;
+    gemini_config: GeminiConfigStatus;
+    vibe_session_logging: VibeSessionLoggingStatus;
+  };
+  cache_awareness: CacheAwarenessReport;
+  provider_capabilities: ProviderCapabilitySummaryReport;
+  /**
+   * LCR phase_3: least-cost-routing eligibility summary (pricing staleness,
+   * per-provider telemetry tier, per-candidate priced/tier, untiered models,
+   * calibration quality). ALWAYS present; compact when routing is disabled.
+   * Economics-only and secret-free (see {@link LeastCostReport}).
+   */
+  least_cost: LeastCostReport;
+  /**
+   * Secret-free local readiness for the optional Personal Agent Config Kit.
+   * Always present, including when the Kit is disabled.
+   */
+  personal_config: PersonalConfigReadinessReport;
+  /**
+   * Slice 6: health of enabled generic `[providers.<name>]` (kind:"api")
+   * providers. OMITTED entirely when none are enabled, so a CLI-only gateway's
+   * report is byte-identical to before. `reachable` is null unless the doctor
+   * was run with `--probe-api-providers` (the reachability probe is opt-in and
+   * off by default; a normal run spends no network or tokens).
+   */
+  api_providers?: ApiProviderHealthReport;
+  upstream: {
+    note: string;
+    recommendation: string;
+    how_to_check: string;
+    /** Whether the expensive installed binary probe was performed (requires --probe-upstream). */
+    probed: boolean;
+    /** Cheap installed versions (always present when CLIs are detected). */
+    installed_versions: Partial<Record<CliType, string | null>>;
+    /**
+     * Installed-versus-contracted comparison. Both halves were already in this
+     * report and were never compared, so a provider could move underneath its
+     * contract and only `pre-release.sh` would ever notice. Offline: it reuses
+     * `installed_versions` above and spawns nothing.
+     */
+    version_guard: {
+      ok: boolean;
+      drifted: CliType[];
+      not_installed: CliType[];
+      unknown: CliType[];
+      providers: ReturnType<typeof import("./provider-version-guard.js").compareInstalledToTargets>;
+    };
+    /** Lightweight declared contracts (always present, no spawning). */
+    contracts: ReturnType<typeof import("./upstream-contracts.js").buildUpstreamContractReport>;
+    /** Full probed report only when --probe-upstream was used. */
+    probe_report?: ReturnType<typeof import("./upstream-contracts.js").buildUpstreamContractReport>;
+  };
+  next_actions: string[];
+}
+
+/**
+ * Stable, ordered readiness stages for the remote HTTP + OAuth connector path.
+ * The order encodes the decision tree: the first failing gate is the reported
+ * stage, so the operator always sees the single next blocking action. These
+ * values are a stable contract consumed by the setup UI, setup assistants, the
+ * installer, docs, and tests; do not renumber or rename them.
+ */
+export type RemoteHttpOAuthStage =
+  | "not_started"
+  | "missing_public_url"
+  | "endpoint_unreachable"
+  | "oauth_disabled"
+  | "unsafe_oauth_config"
+  | "missing_oauth_client"
+  | "missing_workspace"
+  | "ready";
+
+export const REMOTE_HTTP_OAUTH_STAGES: readonly RemoteHttpOAuthStage[] = [
+  "not_started",
+  "missing_public_url",
+  "endpoint_unreachable",
+  "oauth_disabled",
+  "unsafe_oauth_config",
+  "missing_oauth_client",
+  "missing_workspace",
+  "ready",
+] as const;
+
+export interface RemoteHttpOAuthReadiness {
+  ready: boolean;
+  stage: RemoteHttpOAuthStage;
+  /** Redacted public URL (LLM_GATEWAY_PUBLIC_URL), or null when unset. */
+  public_url: string | null;
+  /** Full MCP endpoint URL a connector talks to, or null when no public URL. */
+  mcp_url: string | null;
+  /** Effective authentication mode a remote connector would use. */
+  auth_mode: "oauth" | "bearer_token" | "none";
+  oauth: {
+    enabled: boolean;
+    /** OAuth issuer origin (redacted), or null when OAuth is off / no URL. */
+    issuer: string | null;
+    authorization_url: string | null;
+    token_url: string | null;
+    registration_policy: string;
+    clients_configured: number;
+    consent_required: boolean;
+  };
+  workspace: {
+    ready: boolean;
+    default: string | null;
+    aliases: string[];
+  };
+  /** Deterministic, secret-free next actions for the current stage. */
+  next_actions: string[];
+}
+
+/**
+ * Inputs for the pure readiness builder. Kept normalized (no fs/env access) so
+ * the decision tree is directly unit-testable and so both doctor and the
+ * connector setup command feed it identical data.
+ */
+export interface RemoteHttpOAuthReadinessInput {
+  oauthDiag: Pick<RemoteOAuthConfigDiagnostics, "status" | "config" | "issues">;
+  workspace: RemoteSafeWorkspaceSummary;
+  auth: AuthConfig;
+  transport: "stdio" | "http";
+  /** Redacted public URL. */
+  publicUrl: string | null;
+  endpoint: EndpointExposureReport;
+  mcpPath: string;
+}
+
+/**
+ * Pure decision tree for remote HTTP + OAuth readiness. All URL construction is
+ * delegated to remote-url.ts so doctor, the setup packet, the setup UI, and the
+ * runtime metadata endpoints cannot drift. Never emits secret material.
+ */
+export function buildRemoteHttpOAuthReadiness(
+  input: RemoteHttpOAuthReadinessInput
+): RemoteHttpOAuthReadiness {
+  const { config: oauth, status, issues } = input.oauthDiag;
+  const e = input.endpoint;
+
+  const baseOrigin = resolveConfiguredRemoteOrigin({
+    issuer: oauth.issuer === "auto" ? null : redactDiagnosticUrl(oauth.issuer),
+    publicUrl: input.publicUrl,
+  });
+  const urls = buildRemoteConnectorUrls({
+    baseOrigin,
+    mcpPath: input.mcpPath,
+    oauthEnabled: oauth.enabled,
+  });
+
+  // A usable public endpoint means a configured, HTTPS, publicly-routed URL.
+  const hasValidPublicHttpsUrl =
+    e.public_url_configured &&
+    e.https_configured &&
+    (e.mode === "tunnel" || e.mode === "byo_reverse_proxy");
+  const oauthNotEnabled = status === "absent" || status === "disabled";
+  const oauthUnsafeForRemote =
+    status === "malformed" ||
+    (oauth.enabled && (oauth.allowPublicClients || oauth.registrationPolicy === "open_dev"));
+
+  let stage: RemoteHttpOAuthStage;
+  if (!e.public_url_configured && input.transport !== "http" && status === "absent") {
+    stage = "not_started";
+  } else if (!hasValidPublicHttpsUrl) {
+    stage = "missing_public_url";
+  } else if (e.reachable_from_web === "unreachable") {
+    stage = "endpoint_unreachable";
+  } else if (oauthNotEnabled) {
+    stage = "oauth_disabled";
+  } else if (oauthUnsafeForRemote) {
+    stage = "unsafe_oauth_config";
+  } else if (oauth.registrationPolicy === "static_clients" && oauth.clients.length === 0) {
+    stage = "missing_oauth_client";
+  } else if (!input.workspace.ready) {
+    stage = "missing_workspace";
+  } else {
+    stage = "ready";
+  }
+
+  const authMode: RemoteHttpOAuthReadiness["auth_mode"] = oauth.enabled
+    ? "oauth"
+    : input.auth.required && input.auth.tokenConfigured
+      ? "bearer_token"
+      : "none";
+
+  return {
+    ready: stage === "ready",
+    stage,
+    public_url: input.publicUrl,
+    mcp_url: urls.mcpUrl,
+    auth_mode: authMode,
+    oauth: {
+      enabled: oauth.enabled,
+      issuer: urls.issuer,
+      authorization_url: urls.authorizationUrl,
+      token_url: urls.tokenUrl,
+      registration_policy: oauth.registrationPolicy,
+      clients_configured: oauth.clients.length,
+      consent_required: oauth.requireConsent,
+    },
+    workspace: {
+      ready: input.workspace.ready,
+      default: input.workspace.default,
+      aliases: input.workspace.aliases,
+    },
+    next_actions: remoteReadinessNextActions(stage, {
+      oauth,
+      status,
+      issues,
+      workspace: input.workspace,
+      endpointReachability: e.reachable_from_web,
+    }),
+  };
+}
+
+/**
+ * Deterministic, secret-free next actions keyed by readiness stage. Commands use
+ * angle-bracket placeholders (never real values) and never echo secrets.
+ */
+function remoteReadinessNextActions(
+  stage: RemoteHttpOAuthStage,
+  ctx: {
+    oauth: RemoteOAuthConfigDiagnostics["config"];
+    status: RemoteOAuthConfigDiagnostics["status"];
+    issues: string[];
+    workspace: RemoteSafeWorkspaceSummary;
+    endpointReachability: EndpointExposureReport["reachable_from_web"];
+  }
+): string[] {
+  switch (stage) {
+    case "not_started":
+      return [
+        "Remote HTTP + OAuth setup has not started. Start an HTTPS tunnel or reverse proxy and set LLM_GATEWAY_PUBLIC_URL to the public https URL.",
+        "Then register an OAuth client: llm-cli-gateway oauth client add <client-id> --redirect-uri <connector-callback> --print-once",
+      ];
+    case "missing_public_url":
+      return [
+        "Set LLM_GATEWAY_PUBLIC_URL to a public https URL (tunnel or reverse proxy), not localhost or a LAN address.",
+        "Re-run: llm-cli-gateway doctor --json",
+      ];
+    case "endpoint_unreachable":
+      return [
+        "The public MCP URL is configured but not reachable from the web. Fix tunnel/reverse-proxy routing, then re-run: llm-cli-gateway doctor --json",
+      ];
+    case "oauth_disabled":
+      return [
+        "OAuth is the recommended remote connector authentication mode. Enable it by registering a client: llm-cli-gateway oauth client add <client-id> --redirect-uri <connector-callback> --print-once",
+      ];
+    case "unsafe_oauth_config": {
+      const reasons: string[] = [];
+      if (ctx.status === "malformed") {
+        reasons.push(
+          ...(ctx.issues.length
+            ? ctx.issues
+            : ["The [http.oauth] config is invalid; fix it and re-run doctor --json."])
+        );
+      } else {
+        if (ctx.oauth.allowPublicClients) {
+          reasons.push(
+            "OAuth allow_public_clients is enabled on a public endpoint. Use confidential clients: registration_policy=static_clients with a client secret."
+          );
+        }
+        if (ctx.oauth.registrationPolicy === "open_dev") {
+          reasons.push(
+            "OAuth registration_policy=open_dev is unsafe on a public endpoint. Switch to static_clients with confidential client secrets."
+          );
+        }
+      }
+      reasons.push("Re-run: llm-cli-gateway doctor --json");
+      return reasons;
+    }
+    case "missing_oauth_client":
+      return [
+        "OAuth is enabled but no client is registered. Add one: llm-cli-gateway oauth client add <client-id> --redirect-uri <connector-callback> --print-once",
+      ];
+    case "missing_workspace":
+      return [
+        "No workspace is available for remote provider execution. Register a repo and set it as the default: add a [[workspaces.repos]] entry with [workspaces].default in ~/.llm-cli-gateway/config.toml, or run `llm-cli-gateway workspace add <alias> <absolute-repo-path> --default` when an allowed root is configured.",
+        "Remote clients then select the workspace by alias; local absolute paths are never accepted from remote clients.",
+      ];
+    case "ready": {
+      const readyActions = [
+        ctx.workspace.default
+          ? `Remote connector is ready. Remote provider calls use the default workspace "${ctx.workspace.default}" unless a registered alias is supplied.`
+          : "Remote connector is ready. Remote provider calls must supply a registered workspace alias; set a default with `llm-cli-gateway workspace add <alias> <path> --default` to make one implicit.",
+        "Paste only copy-safe connector fields (MCP URL, authorization URL, token URL, client id) into the remote connector UI.",
+      ];
+      // "ready" means configuration is complete. Reachability is an opt-in probe;
+      // when it has not run, say so rather than implying the endpoint was verified.
+      if (ctx.endpointReachability === "not_checked") {
+        readyActions.push(
+          "Config is complete but public reachability was not verified. Set LLM_GATEWAY_VERIFY_PUBLIC_URL=1 and re-run doctor --json to confirm the public URL is reachable from the web."
+        );
+      }
+      return readyActions;
+    }
+    default:
+      return [];
+  }
+}
+
+/**
+ * Assemble readiness inputs from the live environment/config and run the pure
+ * builder. Reused by the connector setup command so its readiness/next_actions
+ * are byte-identical to doctor's.
+ */
+export function gatherRemoteHttpOAuthReadiness(
+  env: NodeJS.ProcessEnv = process.env
+): RemoteHttpOAuthReadiness {
+  const oauthDiag = diagnoseRemoteOAuthConfig(undefined, env);
+  const workspace = remoteSafeWorkspaceSummary(loadWorkspaceRegistry());
+  const auth = loadAuthConfig(env);
+  const transport = defaultTransport(env);
+  const publicUrl = redactDiagnosticUrl(env.LLM_GATEWAY_PUBLIC_URL || null);
+  const endpoint = createEndpointExposureReport(env, publicUrl);
+  const mcpPath = env.LLM_GATEWAY_HTTP_PATH || "/mcp";
+  return buildRemoteHttpOAuthReadiness({
+    oauthDiag,
+    workspace,
+    auth,
+    transport,
+    publicUrl,
+    endpoint,
+    mcpPath,
+  });
+}
+
+function packageVersion(): string {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const candidates = [join(here, "..", "package.json"), join(here, "..", "..", "package.json")];
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(readFileSync(candidate, "utf8")) as { version?: string };
+      return parsed.version || "unknown";
+    } catch {
+      // Try next candidate.
+    }
+  }
+  return "unknown";
+}
+
+function clientConfigStatus(home = homedir()): DoctorReport["client_config"] {
+  return {
+    claude_desktop_config_present:
+      existsSync(join(home, "Library/Application Support/Claude/claude_desktop_config.json")) ||
+      existsSync(join(home, ".config", "Claude", "claude_desktop_config.json")),
+    codex_config_present: existsSync(join(home, ".codex", "config.toml")),
+    gemini_settings_present:
+      existsSync(join(home, ".gemini", "settings.json")) ||
+      existsSync(join(home, ".config", "gemini", "settings.json")),
+    gemini_config: checkGeminiConfig(process.cwd(), home),
+    vibe_session_logging: checkVibeSessionLogging(home),
+  };
+}
+
+function defaultTransport(env: NodeJS.ProcessEnv): "stdio" | "http" {
+  if (env.LLM_GATEWAY_TRANSPORT === "http" || env.MCP_TRANSPORT === "http") return "http";
+  return "stdio";
+}
+
+function chatGPTConnectorUrl(env: NodeJS.ProcessEnv, rawPublicUrl: string | null): string | null {
+  const path = (env.LLM_GATEWAY_NO_AUTH_PATHS || "")
+    .split(/[,;\s]+/)
+    .map(value => value.trim())
+    .find(value => value.startsWith("/") && !value.includes("?") && !value.includes("#"));
+  if (!rawPublicUrl || !path) return null;
+  return "<redacted>";
+}
+
+export interface CreateDoctorReportOptions {
+  env?: NodeJS.ProcessEnv;
+  /**
+   * The asynchronous storage scan, performed by the caller. `createDoctorReport`
+   * stays a pure synchronous projection, exactly as it does for `cacheStats`
+   * and `lcrPriors`; omitted, the report says `scanned: false` rather than
+   * inventing zeroes.
+   */
+  storage?: StorageHealthReport;
+  /**
+   * Cache aggregates over the last 24h, ALREADY READ from the flight recorder.
+   * Drives cache_awareness.last_24h and per_cli. When absent, those blocks
+   * report zeroed aggregates (still PRESENT in the report).
+   *
+   * s7: this used to be the recorder handle itself. The recorder is
+   * asynchronous now, and `createDoctorReport` is a pure synchronous
+   * projection whose only I/O was this one scan; `printDoctorJson` does the
+   * read, with its own failure degrading to the zeroed block exactly as the
+   * try/catch here used to.
+   */
+  cacheStats?: GlobalCacheStats;
+  /**
+   * Least-cost calibration priors, ALREADY READ. Same reason as `cacheStats`.
+   * Absent means "not read": either routing is off, `priors_scope` is off, the
+   * recorder is unavailable, or the scan failed. All four leave
+   * `calibrationQuality` empty, which is what the previous code did too.
+   */
+  lcrPriors?: LcrPriors;
+  /**
+   * Optional CacheAwarenessConfig. Drives `enabled_features`. When
+   * absent, `enabled_features` is empty (all behaviour considered off).
+   */
+  cacheAwareness?: CacheAwarenessConfig;
+  /**
+   * When true, perform the (potentially slow) installed CLI --help probe
+   * for upstream contract drift detection. This is opt-in because it
+   * spawns the real provider CLIs.
+   */
+  probeUpstream?: boolean;
+  /**
+   * Slice 6: resolved API-provider config. When present and at least one
+   * provider is enabled, the report gains the `api_providers` block. When
+   * absent, the block is omitted (byte-identical CLI-only report).
+   */
+  providersConfig?: ProvidersConfig;
+  /**
+   * Slice 6: precomputed reachability results keyed by provider name, supplied
+   * by `printDoctorJson` only when the opt-in `--probe-api-providers` flag is
+   * set. `createDoctorReport` itself never opens a socket: when this is absent,
+   * every entry's `reachable` is null.
+   */
+  apiReachability?: Record<string, { reachable: boolean; error?: string }>;
+  /**
+   * LCR phase_3: resolved least-cost-routing config. Drives the `least_cost`
+   * block (enabled flag, tier map, priors scope, catalog-price preference). When
+   * absent, the all-off `defaultLeastCostConfig()` is used, so the block is still
+   * present in its compact disabled form.
+   */
+  leastCost?: LeastCostConfig;
+  /**
+   * Optional precomputed, redacted Personal Agent Config Kit readiness for an
+   * embedded caller. Normal doctor invocations compute it from local state.
+   */
+  personalConfigReadiness?: PersonalConfigReadinessReport;
+}
+
+const PERSONAL_CONFIG_RELEASE_ID_PATTERN = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i;
+
+function redactedReleaseId(value: string | null | undefined): string | null {
+  return value && PERSONAL_CONFIG_RELEASE_ID_PATTERN.test(value) ? value.toLowerCase() : null;
+}
+
+function redactedTimestamp(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : null;
+}
+
+/**
+ * Build the report-safe readiness view from already-resolved local state.
+ * Untrusted status strings are normalized or withheld before they can reach
+ * the doctor JSON surface.
+ */
+/**
+ * Kit eligibility for one provider. Every blocker is a condition an operator
+ * can act on; none of them names a path or exposes a credential value.
+ */
+function buildProviderKitEligibility(
+  provider: CliType,
+  input: {
+    enabled: boolean;
+    configurationValid: boolean;
+    baselinePresent: boolean;
+    currentReleaseId: string | null;
+    stale: boolean;
+    durableAsyncConfigured: boolean;
+    credentialEnvConfigured: Record<string, boolean>;
+  }
+): ProviderKitEligibility {
+  const kit = getProviderPersonalConfigKit(provider);
+  const credentialEnv = kit.requiredCredentialEnv;
+  const credentialConfigured =
+    credentialEnv !== null && input.credentialEnvConfigured[credentialEnv] === true;
+  const blockers: string[] = [];
+
+  if (!kit.supported) {
+    blockers.push(
+      `${getKitProviderLabel(provider)} has no Personal Agent Config Kit route; Kit requests for it fail closed`
+    );
+    return {
+      kit_supported: false,
+      eligible: false,
+      isolation_model: kit.isolationModel,
+      required_credential_env: credentialEnv,
+      required_credential_configured: credentialConfigured,
+      blockers,
+    };
+  }
+
+  if (!input.enabled) blockers.push("[personal_config].enabled is false");
+  if (!input.configurationValid) blockers.push("Personal Agent Config settings are unreadable");
+  if (input.enabled && input.configurationValid) {
+    if (!input.baselinePresent) blockers.push("no local baseline Git repository; run config_init");
+    if (input.currentReleaseId === null)
+      blockers.push("no active verified release; run config_sync");
+    if (input.stale) blockers.push("the active release is stale; run config_sync");
+    if (!input.durableAsyncConfigured) {
+      blockers.push("durable job admission is not configured; set [persistence].backend");
+    }
+    if (credentialEnv !== null && !credentialConfigured) {
+      blockers.push(`${credentialEnv} is not set in the gateway process environment`);
+    }
+  }
+
+  return {
+    kit_supported: true,
+    eligible: blockers.length === 0,
+    isolation_model: kit.isolationModel,
+    required_credential_env: credentialEnv,
+    required_credential_configured: credentialConfigured,
+    blockers,
+  };
+}
+
+export function buildPersonalConfigReadinessReport(
+  input: PersonalConfigReadinessInput
+): PersonalConfigReadinessReport {
+  const configurationValid = input.configurationValid ?? true;
+  const status = input.enabled && configurationValid ? input.status : undefined;
+  const claudeBareAuthConfigured =
+    input.enabled && configurationValid && input.claudeBareAuthConfigured === true;
+  const durableAsyncConfigured =
+    input.enabled &&
+    configurationValid &&
+    input.persistence !== null &&
+    input.persistence !== undefined &&
+    (input.persistence.backend === "sqlite" || input.persistence.backend === "postgres") &&
+    input.persistence.asyncJobsEnabled;
+  const baselinePresent = status?.baselinePresent === true;
+  const currentReleaseId = redactedReleaseId(status?.currentReleaseId);
+  const lastSuccessAt = redactedTimestamp(status?.lastSuccessAt);
+  const stale = status?.stale === true;
+  // Claude's credential presence arrives on its own legacy input; fold it into
+  // the generic env map so every provider reads its requirement the same way.
+  const credentialEnvConfigured: Record<string, boolean> = {
+    ...(input.credentialEnvConfigured ?? {}),
+  };
+  if (input.claudeBareAuthConfigured === true) credentialEnvConfigured.ANTHROPIC_API_KEY = true;
+  const providerEligibility = Object.fromEntries(
+    CLI_TYPES.map(provider => [
+      provider,
+      buildProviderKitEligibility(provider, {
+        enabled: input.enabled,
+        configurationValid,
+        baselinePresent,
+        currentReleaseId,
+        stale,
+        durableAsyncConfigured,
+        credentialEnvConfigured,
+      }),
+    ])
+  ) as Record<CliType, ProviderKitEligibility>;
+
+  return {
+    enabled: input.enabled,
+    configuration_valid: configurationValid,
+    ready:
+      !input.enabled ||
+      (configurationValid &&
+        baselinePresent &&
+        currentReleaseId !== null &&
+        !stale &&
+        durableAsyncConfigured &&
+        claudeBareAuthConfigured),
+    claude_bare_auth_configured: claudeBareAuthConfigured,
+    baseline_present: baselinePresent,
+    current_release_id: currentReleaseId,
+    last_success_at: lastSuccessAt,
+    stale,
+    last_sync_error: status?.lastSyncError ? PERSONAL_CONFIG_SYNC_ERROR_WITHHELD : null,
+    durable_async_configured: durableAsyncConfigured,
+    provider_eligibility: providerEligibility,
+  };
+}
+
+/**
+ * Presence-only signals for every Kit credential env var the registry names.
+ * Reads whether each variable resolves to a non-empty value; never its value.
+ */
+function readKitCredentialEnv(env: NodeJS.ProcessEnv): Record<string, boolean> {
+  const configured: Record<string, boolean> = {};
+  for (const provider of CLI_TYPES) {
+    const name = getProviderPersonalConfigKit(provider).requiredCredentialEnv;
+    if (name) configured[name] = Boolean(env[name]?.trim());
+  }
+  return configured;
+}
+
+function loadPersonalConfigReadinessReport(
+  env: NodeJS.ProcessEnv = process.env
+): PersonalConfigReadinessReport {
+  try {
+    const { settings } = loadPersonalConfigSettings();
+    if (!settings.enabled) {
+      return buildPersonalConfigReadinessReport({ enabled: false });
+    }
+
+    const status = new PersonalConfigManager(settings).status();
+    let persistence: Pick<PersistenceConfig, "backend" | "asyncJobsEnabled"> | null = null;
+    try {
+      const resolved = loadPersistenceConfig();
+      persistence = {
+        backend: resolved.backend,
+        asyncJobsEnabled: resolved.asyncJobsEnabled,
+      };
+    } catch {
+      // A durable backend cannot be asserted when its configuration is invalid.
+    }
+
+    return buildPersonalConfigReadinessReport({
+      enabled: true,
+      status,
+      persistence,
+      claudeBareAuthConfigured: Boolean(env.ANTHROPIC_API_KEY?.trim()),
+      credentialEnvConfigured: readKitCredentialEnv(env),
+    });
+  } catch {
+    // Do not expose parsing, filesystem, or Git diagnostics through doctor.
+    // Treat an unreadable Kit configuration as enabled and not ready so a
+    // malformed config cannot silently appear as a disabled Kit.
+    return buildPersonalConfigReadinessReport({ enabled: true, configurationValid: false });
+  }
+}
+
+/**
+ * Slice 6: build the api_providers health block from the resolved providers
+ * config. Returns undefined when no API providers are enabled so the caller can
+ * OMIT the key entirely (dormant byte-identical). Reads only key presence + the
+ * env var name; never the key value. Reachability is whatever the caller
+ * precomputed (null when the opt-in probe did not run).
+ */
+function buildApiProviderHealthReport(
+  opts: CreateDoctorReportOptions,
+  env: NodeJS.ProcessEnv
+): ApiProviderHealthReport | undefined {
+  const config = opts.providersConfig;
+  if (!config) return undefined;
+  const providers: Record<string, ApiProviderHealthEntry> = {};
+  // Delegate the status projection to provider-status and the credential
+  // guidance to provider-login-guidance, so doctor stays a thin consumer.
+  for (const providerConfig of Object.values(config.providers)) {
+    const status = getApiProviderStatus(providerConfig, env);
+    if (!status.enabled) continue;
+    const probe = opts.apiReachability?.[status.provider];
+    providers[status.provider] = {
+      name: status.provider,
+      kind: status.kind,
+      base_url: status.baseUrl,
+      default_model: status.defaultModel,
+      models: status.models,
+      api_key_env: status.apiKeyEnv,
+      api_key_present: status.apiKeyPresent,
+      reachable: probe ? probe.reachable : null,
+      ...(probe?.error ? { reachability_error: probe.error } : {}),
+      login_guidance: getApiProviderLoginGuidance(providerConfig),
+    };
+  }
+  const names = Object.keys(providers);
+  if (names.length === 0) return undefined;
+  return { enabled_count: names.length, providers };
+}
+
+/**
+ * Build the cache_awareness block. ALWAYS present in the report; fields
+ * are zeroed when the flight recorder is missing or empty.
+ */
+function buildCacheAwarenessReport(opts: CreateDoctorReportOptions): CacheAwarenessReport {
+  const enabled: CacheAwarenessReport["enabled_features"] = [];
+  if (opts.cacheAwareness?.emitAnthropicCacheControl) {
+    enabled.push("anthropic_cache_control");
+  }
+  if (opts.cacheAwareness?.warnOnTtlExpiry) {
+    enabled.push("ttl_warnings");
+  }
+
+  const stats = opts.cacheStats;
+  if (!stats) {
+    return {
+      enabled_features: enabled,
+      last_24h: {
+        hit_rate: 0,
+        total_hits: 0,
+        total_requests: 0,
+        estimated_savings_usd: 0,
+      },
+      per_cli: {},
+    };
+  }
+
+  const perCli: CacheAwarenessReport["per_cli"] = {};
+  for (const entry of stats.perCli) {
+    perCli[entry.cli] = {
+      hit_rate: entry.hitRate,
+      total_hits: entry.hitCount,
+      total_cache_read_tokens: entry.totalCacheReadTokens,
+    };
+  }
+
+  return {
+    enabled_features: enabled,
+    last_24h: {
+      hit_rate: stats.hitRate,
+      total_hits: stats.totalHits,
+      total_requests: stats.totalRequests,
+      estimated_savings_usd: stats.estimatedSavingsUsd,
+    },
+    per_cli: perCli,
+  };
+}
+
+const MS_PER_DAY = 86_400_000;
+
+/**
+ * Whole days since the NEWER (more recent) of the two price-table `asOf` dates
+ * relative to the doctor run date. Clamped to >= 0 so a future asOf (clock skew)
+ * reads as fresh rather than negative. Reuses the report's own run timestamp.
+ */
+function computePricingStaleDays(runIso: string): number {
+  const run = Date.parse(runIso);
+  const table = Date.parse(PRICING_AS_OF);
+  const catalog = Date.parse(API_CATALOG_AS_OF);
+  const newer = Math.max(table, catalog);
+  if (!Number.isFinite(run) || !Number.isFinite(newer)) return 0;
+  const days = Math.floor((run - newer) / MS_PER_DAY);
+  return days > 0 ? days : 0;
+}
+
+/**
+ * LCR phase_3: build the economics-only `least_cost` eligibility block. Pure over
+ * the model registry (getCliInfo), pricing (getModelCost/modelIdToFamily), the
+ * per-provider telemetry tiers, and the resolved LeastCostConfig; the only I/O is
+ * an optional read-only flight-recorder scan for calibration quality. Never
+ * spawns a CLI. Compact when routing is disabled.
+ */
+function buildLeastCostReport(
+  cfg: LeastCostConfig,
+  generatedAt: string,
+  priors?: LcrPriors
+): LeastCostReport {
+  const pricing = {
+    tableAsOf: PRICING_AS_OF,
+    apiCatalogAsOf: API_CATALOG_AS_OF,
+    staleDays: computePricingStaleDays(generatedAt),
+  };
+
+  // Disabled: emit the compact form. pricing still surfaces staleness so an
+  // operator sees drift even with routing off; the eligibility arrays are empty.
+  if (!cfg.enabled) {
+    return { enabled: false, pricing, providers: [], untieredModels: [], calibrationQuality: [] };
+  }
+
+  // Resolved tier map keyed `provider:family`. A Map keeps the lookup off the
+  // dynamic-object-index sink for the arbitrary-string tier keys.
+  const tierMap = new Map<string, QualityTier>(Object.entries(cfg.tiers));
+  const cliInfo = getCliInfo();
+  const providers: LeastCostProviderReport[] = [];
+  const untieredModels: string[] = [];
+
+  for (const provider of CLI_TYPES) {
+    const candidates: LeastCostCandidateReport[] = Object.keys(cliInfo[provider].models).map(
+      model => {
+        const family = modelIdToFamily(model);
+        const cost = getModelCost(provider, model, { preferCatalog: cfg.preferCatalogPrice });
+        const tier = tierMap.get(`${provider}:${family}`) ?? null;
+        if (tier === null) {
+          untieredModels.push(`${provider}:${model}`);
+        }
+        return {
+          model,
+          family,
+          priced: cost.source !== "unknown",
+          priceSource: cost.source,
+          tier,
+        };
+      }
+    );
+    providers.push({
+      provider,
+      telemetryTier: telemetryTierFor(provider),
+      candidates,
+    });
+  }
+
+  // Calibration quality from the flight recorder, scoped by priors_scope. Empty
+  // when there is no recorder, learning is off, or the scan finds no data. The
+  // priors shape is anonymized model-level (content-type:family), never per
+  // principal, so no caller identity can leak here.
+  const calibrationQuality: LeastCostCalibrationBucketReport[] = [];
+  if (priors && cfg.priorsScope !== "off") {
+    for (const [bucket, entry] of priors.calibration) {
+      calibrationQuality.push({
+        bucket,
+        k: entry.k,
+        samples: entry.samples,
+        confidence: entry.confidence,
+      });
+    }
+  }
+
+  return { enabled: true, pricing, providers, untieredModels, calibrationQuality };
+}
+
+function buildProviderCapabilitySummary(
+  providerStatuses: Record<CliType, ProviderRuntimeStatus>
+): ProviderCapabilitySummaryReport {
+  const capabilities = getProviderToolCapabilities({
+    includeSkills: true,
+    includeProviderTools: true,
+    includeUnsupported: true,
+    includePaths: false,
+  });
+  const providers = Object.fromEntries(
+    knownProviderCapabilityIds().map(provider => {
+      const capability = capabilities[provider];
+      if (!capability) {
+        throw new Error(`Missing provider capability record for ${provider}`);
+      }
+      const cliAvailable =
+        provider === "grok_api"
+          ? capability.gatewayRequestTools.includes("grok_api_request")
+          : providerStatuses[provider].installed;
+      return [
+        provider,
+        {
+          provider_kind: capability.providerKind,
+          cli_available: cliAvailable,
+          gateway_request_tools: capability.gatewayRequestTools,
+          supported_features: Object.entries(capability.features)
+            .filter(([, feature]) => feature.supported)
+            .map(([name]) => name),
+          unsupported_inputs: capability.unsupportedInputs.map(input => input.input),
+          config_surface_count: capability.configSurfaces.length,
+          discovered_skill_count: capability.discoveredSkills.length,
+          discovered_provider_tool_count: capability.discoveredProviderTools.length,
+          warnings: capability.warnings,
+        },
+      ];
+    })
+  ) as ProviderCapabilitySummaryReport["providers"];
+
+  return {
+    schema_version: "provider-tool-capabilities.v2",
+    tool: "provider_tool_capabilities",
+    resources: {
+      catalog: "provider-tools://catalog",
+      providers: Object.fromEntries(
+        knownProviderCapabilityIds().map(provider => [provider, `provider-tools://${provider}`])
+      ) as Record<ProviderCapabilityId, string>,
+    },
+    cache_ttl_ms: 60_000,
+    providers,
+  };
+}
+
+/** The block a synchronous caller gets: no scan was run, and it says so. */
+export function unscannedStorageHealth(): StorageHealthReport {
+  return {
+    scanned: false,
+    flight_recorder: {
+      state: null,
+      path: resolveFlightRecorderDbPath(),
+      reads_are_authoritative: false,
+      error: null,
+      file_bytes: null,
+      wal_bytes: null,
+      schema_version: null,
+      request_rows: null,
+      oldest_request: null,
+      newest_request: null,
+    },
+    job_store: { backend: "unknown", path: null, shares_flight_recorder_file: false },
+    retention: {
+      days: null,
+      unbounded: [],
+      policy: null,
+      requests_beyond_retention: null,
+      reclaimable_bytes: null,
+    },
+    co_resident: [],
+    warnings: [],
+  };
+}
+
+/**
+ * A file this big with no bound is the symptom an operator feels. 256 MiB is
+ * well below the measured 1.2 GB and well above any fresh installation, so it
+ * fires long before the file is a problem and never on a quiet one.
+ */
+const UNBOUNDED_TRANSCRIPT_WARN_BYTES = 256 * 1024 * 1024;
+
+function policyDays(persistence: PersistenceConfig, id: RetentionSubsystemId): number | null {
+  return persistenceRetentionPolicy(persistence).days[id];
+}
+
+/** doctor writes its own report; the factory's progress lines are not part of it. */
+const noopDoctorLogger = { info: (): void => {}, error: (): void => {} };
+
+function fileBytes(path: string): number | null {
+  try {
+    return statSync(path).size;
+  } catch {
+    // A missing WAL is normal; a missing main file is reported by the state.
+    return null;
+  }
+}
+
+/**
+ * Open the recorder, read its own numbers, and report the failure if either
+ * step fails INSTEAD of degrading to a zeroed block.
+ *
+ * The open and the read are separate states on purpose. "Could not open" and
+ * "opened and then the read failed" have different causes and different fixes,
+ * and doctor collapsed both into silence.
+ */
+export async function collectStorageHealth(
+  existing?: FlightRecorderLike | null
+): Promise<StorageHealthReport> {
+  const block = unscannedStorageHealth();
+  block.scanned = true;
+  const dbPath = resolveFlightRecorderDbPath();
+
+  let persistence: PersistenceConfig | null = null;
+  try {
+    persistence = loadPersistenceConfig();
+  } catch {
+    // A config that will not load is already reported by the gateway block.
+  }
+  if (persistence) {
+    block.job_store = {
+      backend: persistence.backend,
+      path: persistence.path,
+      shares_flight_recorder_file: Boolean(
+        dbPath && persistence.path && resolve(persistence.path) === resolve(dbPath)
+      ),
+    };
+    block.retention.days = persistence.retentionDays;
+    const policy = persistenceRetentionPolicy(persistence);
+    block.retention.policy = { ...policy.days };
+    block.retention.unbounded = unboundedRetentionSubsystems(policy);
+  }
+
+  if (!persistence) {
+    block.flight_recorder.state = "unavailable";
+    block.flight_recorder.path = null;
+    block.flight_recorder.error = "Persistence configuration is invalid";
+    block.warnings.push(
+      "Flight recorder is unavailable because the persistence configuration is invalid."
+    );
+    return block;
+  }
+
+  if (!dbPath) {
+    const disabled = flightRecorderHealth(flightRecorderDisabled());
+    block.flight_recorder.state = disabled.state;
+    block.flight_recorder.path = null;
+    block.flight_recorder.error = null;
+    const message = flightRecorderHealthMessage(disabled);
+    if (message) block.warnings.push(message);
+    return block;
+  }
+
+  // A caller that already holds one hands it over, so doctor does not put a
+  // second writer on the same file to ask it how big it is.
+  const ownsRecorder = !existing;
+  let recorder: FlightRecorderLike;
+  if (existing) {
+    recorder = existing;
+  } else {
+    // The FACTORY, not `new FlightRecorder`. Building the SQLite recorder here
+    // unconditionally meant doctor reported a file on a host whose transcripts
+    // had moved to PostgreSQL, which is the same "one subsystem, two engines"
+    // confusion this block exists to expose.
+    // The invalid-config/no-recorder case returned above, so persistence is
+    // present on this branch.
+    const configured = persistence as PersistenceConfig;
+    recorder = createFlightRecorder(noopDoctorLogger, configured.backend, configured.roleDsns);
+  }
+  const onSqliteFile = recorder instanceof FlightRecorder;
+
+  // The `requests` bound when one is set, otherwise the job bound, which is
+  // what this line has always used. Reporting the JOB window as "requests
+  // beyond retention" was the closest thing to a transcript number that
+  // existed; now it is only a fallback, and a set bound answers with its own.
+  const cutoffDays =
+    (persistence ? policyDays(persistence, "requests") : null) ?? block.retention.days;
+  const cutoff =
+    cutoffDays !== null ? new Date(Date.now() - cutoffDays * 86_400_000).toISOString() : undefined;
+  try {
+    const stats = await recorder.readStorageStats(cutoff);
+    block.flight_recorder.schema_version = stats.schemaVersion;
+    block.flight_recorder.request_rows = stats.requestRows;
+    block.flight_recorder.oldest_request = stats.oldestRequest;
+    block.flight_recorder.newest_request = stats.newestRequest;
+    block.retention.requests_beyond_retention = stats.requestsBeyondRetention;
+    block.retention.reclaimable_bytes = stats.reclaimableBytes;
+    block.co_resident = stats.coResident.map((row: CoResidentTableStats) => ({
+      table: row.table,
+      rows: row.rows,
+      unfinished: row.unfinished,
+      // A `jobs` table in this file is LIVE only while the job store is the
+      // same SQLite file. Otherwise it is the abandoned copy, frozen at the
+      // switchover, and its rows will never move again.
+      // A `jobs` table is LIVE when the job store is the same store. On
+      // PostgreSQL that is the unified case rather than the abandoned one, so
+      // the file-path comparison alone would report a live table as frozen.
+      live:
+        row.table === "jobs"
+          ? block.job_store.shares_flight_recorder_file ||
+            (!onSqliteFile && persistence?.backend === "postgres")
+          : true,
+    }));
+  } catch (error) {
+    // Reached the file and could not read it. The health snapshot below is
+    // already `degraded` because every operation records its own failure; this
+    // catch exists so doctor still emits a report rather than throwing.
+    const detail = onSqliteFile
+      ? error instanceof Error
+        ? error.message
+        : String(error)
+      : postgresFailureMessage(error);
+    block.warnings.push(`Reading flight-recorder storage statistics FAILED: ${detail}`);
+  }
+
+  const health = flightRecorderHealth(recorder);
+  block.flight_recorder.state = health.state;
+  block.flight_recorder.path = health.path;
+  block.flight_recorder.error = health.error;
+  block.flight_recorder.reads_are_authoritative = flightRecorderReadsAreAuthoritative(health);
+  // Only when the recorder is actually the file. A byte count of a file nothing
+  // writes to is worse than none: it is a measurement of the wrong thing.
+  block.flight_recorder.file_bytes = onSqliteFile ? fileBytes(dbPath) : null;
+  block.flight_recorder.wal_bytes = onSqliteFile ? fileBytes(`${dbPath}-wal`) : null;
+  const recorderMessage = flightRecorderHealthMessage(health);
+  if (recorderMessage) block.warnings.push(recorderMessage);
+
+  // `unbounded` is set from the resolved policy above, not decided here.
+  // s11 left the two destructive bounds OFF by default, so on an unchanged
+  // installation this still reports `requests` and `wedgedValidationRuns`, and
+  // the numbers beside it are what an operator needs to decide otherwise.
+  if (
+    block.retention.unbounded.includes("requests") &&
+    (block.flight_recorder.file_bytes ?? 0) > UNBOUNDED_TRANSCRIPT_WARN_BYTES
+  ) {
+    block.warnings.push(
+      `The flight recorder holds ${block.flight_recorder.request_rows ?? "?"} request(s) in ` +
+        `${Math.round((block.flight_recorder.file_bytes ?? 0) / 1_048_576)} MiB with NO retention bound. ` +
+        `Set [persistence.retention].requests = <days> to bound it; ` +
+        `deleting rows frees pages but not bytes, so run 'llm-cli-gateway storage compact' after.`
+    );
+  }
+
+  // #296: the two windows are inverted relative to information content. The
+  // `requests` row keeps the prompt and the final text; the `jobs` row keeps the
+  // launched argv and the raw provider stream, and it is the only one of the two
+  // a dispatched run can be replayed from. Bounding the complete record and not
+  // the partial one is a defensible choice, but a silent one is not: on an
+  // unchanged installation it is what happens by default.
+  //
+  // Gated on the OLDEST request rather than on the configuration, because the
+  // configuration alone is true on every host and a warning that always fires is
+  // read as background. This fires once a request actually outlives the job
+  // window, which is the moment the loss became real on THIS host.
+  const jobBoundDays = block.retention.policy?.jobs ?? null;
+  const oldest = block.flight_recorder.oldest_request;
+  if (
+    jobBoundDays !== null &&
+    block.retention.unbounded.includes("requests") &&
+    oldest !== null &&
+    Date.parse(oldest) < Date.now() - jobBoundDays * 86_400_000
+  ) {
+    block.warnings.push(
+      `Retention is inverted: 'requests' is unbounded and 'jobs' is bounded at ${jobBoundDays} day(s), ` +
+        `and the oldest request (${oldest}) is already past that window. The job row holds the launched argv ` +
+        `and the raw provider output; the request row holds the prompt and the final text only. ` +
+        `Requests older than the job bound can no longer be replayed. Set [persistence.retention].jobs ` +
+        `to widen the complete record, or [persistence.retention].requests to stop keeping the partial one forever.`
+    );
+  }
+  for (const row of block.co_resident) {
+    if (!row.live && row.rows > 0) {
+      block.warnings.push(
+        `The flight recorder's file also holds an ABANDONED '${row.table}' table of ${row.rows} rows (${row.unfinished} never finished). The live job store is '${block.job_store.backend}'. A direct reader of this file cannot tell that table is frozen.`
+      );
+    } else if (row.unfinished > 0 && row.table === "validation_runs") {
+      // s11 gave validation_runs a bound, so "nothing covers this" stopped
+      // being true and the warning now names the key instead of the absence.
+      // `unfinished` is `status = 'running'`, which is a SUPERSET of wedged: a
+      // run whose linked jobs are alive is unfinished and is not reapable.
+      const bounded = !block.retention.unbounded.includes("wedgedValidationRuns");
+      block.warnings.push(
+        `${row.unfinished} validation run(s) are still 'running'. Some may be WEDGED (past the ` +
+          `horizon with every linked job already evicted), which nothing can ever finalize. ` +
+          (bounded
+            ? "[persistence.retention].wedgedValidationRuns is set, so the sweeper reaps those; llm_process_health reports the counts."
+            : "Set [persistence.retention].wedgedValidationRuns = <days> to reap them; llm_process_health reports what that would delete first.")
+      );
+    }
+  }
+
+  if (ownsRecorder) {
+    try {
+      await recorder.close();
+    } catch {
+      // best effort
+    }
+  }
+  return block;
+}
+
+export function createDoctorReport(
+  envOrOptions: NodeJS.ProcessEnv | CreateDoctorReportOptions = process.env
+): DoctorReport {
+  // Preserve back-compat: previous signature accepted a bare `env` object.
+  const opts: CreateDoctorReportOptions = isCreateDoctorReportOptions(envOrOptions)
+    ? envOrOptions
+    : { env: envOrOptions };
+  const env: NodeJS.ProcessEnv = opts.env ?? process.env;
+  const auth = loadAuthConfig(env);
+  const oauthDiag = diagnoseRemoteOAuthConfig(undefined, env);
+  const oauth = oauthDiag.config;
+  const workspaceRegistry = loadWorkspaceRegistry();
+  const transport = defaultTransport(env);
+  const rawPublicUrl = env.LLM_GATEWAY_PUBLIC_URL || null;
+  const publicUrl = redactDiagnosticUrl(rawPublicUrl);
+  const endpointExposure = createEndpointExposureReport(env, publicUrl);
+  const providerStatuses = listProviderRuntimeStatuses();
+  const installedVersions: Partial<Record<CliType, string | null>> = {};
+  for (const [name, status] of Object.entries(providerStatuses)) {
+    installedVersions[name as CliType] = status.version;
+  }
+
+  const lightweightContracts = buildUpstreamContractReport({ probeInstalled: false });
+  const probeReport = opts.probeUpstream
+    ? buildUpstreamContractReport({ probeInstalled: true })
+    : undefined;
+
+  // Compare the two halves this report already had. Offline and free: it reads
+  // installedVersions above rather than spawning anything, so it runs on every
+  // doctor invocation instead of waiting for --probe-upstream.
+  const versionVerdicts = compareInstalledToTargets(installedVersions);
+  const versionSummary = summarizeVersionGuard(versionVerdicts);
+
+  const upstream: DoctorReport["upstream"] = {
+    note: "The gateway declares strict contracts for what flags, output modes, permission modes, and session/resume behaviour each provider CLI is expected to support.",
+    recommendation: versionSummary.ok
+      ? "Installed provider CLI versions match their contracted targets. Run the installed binary probe after any provider upgrade to also compare advertised flags and subcommands."
+      : `Installed provider CLI versions have drifted from their contracted targets (${versionSummary.drifted.join(", ")}). The declared flags and subcommands for those providers may no longer match what the installed binary advertises; run the installed binary probe to confirm before releasing.`,
+    how_to_check: "llm-cli-gateway contracts --json --probe-installed   (or with --cli=grok etc.)",
+    probed: !!opts.probeUpstream,
+    installed_versions: installedVersions,
+    version_guard: {
+      ok: versionSummary.ok,
+      drifted: versionSummary.drifted,
+      not_installed: versionSummary.notInstalled,
+      unknown: versionSummary.unknown,
+      providers: versionVerdicts,
+    },
+    contracts: lightweightContracts,
+  };
+  if (probeReport) {
+    upstream.probe_report = probeReport;
+  }
+
+  const generatedAt = new Date().toISOString();
+  const leastCostConfig = opts.leastCost ?? defaultLeastCostConfig();
+  const personalConfigReadiness =
+    opts.personalConfigReadiness ?? loadPersonalConfigReadinessReport(env);
+
+  const report: DoctorReport = {
+    schema_version: "1.2",
+    ok: true,
+    storage: opts.storage ?? unscannedStorageHealth(),
+    generated_at: generatedAt,
+    system: {
+      os: platform(),
+      arch: arch(),
+      release: release(),
+      node_version: process.version,
+    },
+    gateway: {
+      name: "llm-cli-gateway",
+      version: packageVersion(),
+    },
+    transport: {
+      default: transport,
+      http: {
+        enabled: transport === "http",
+        host: env.LLM_GATEWAY_HTTP_HOST || "127.0.0.1",
+        port: Number(env.LLM_GATEWAY_HTTP_PORT || 3333),
+        path: env.LLM_GATEWAY_HTTP_PATH || "/mcp",
+        public_url_configured: Boolean(publicUrl),
+        public_url: publicUrl,
+        chatgpt_connector_url: chatGPTConnectorUrl(env, rawPublicUrl),
+      },
+    },
+    auth: {
+      required: auth.required,
+      token_configured: auth.tokenConfigured,
+      source: auth.source,
+      oauth: {
+        enabled: oauth.enabled,
+        registration_policy: oauth.registrationPolicy,
+        clients_configured: oauth.clients.length,
+        shared_secret_enabled: Boolean(oauth.sharedSecret?.enabled),
+        pkce_required: oauth.requirePkce,
+        issuer:
+          oauth.issuer === "auto"
+            ? publicUrl
+            : redactDiagnosticUrl(oauth.issuer === "auto" ? null : oauth.issuer),
+      },
+    },
+    workspaces: {
+      enabled: workspaceRegistry.enabled,
+      default: workspaceRegistry.defaultAlias,
+      repo_count: workspaceRegistry.repos.length,
+      allowed_root_count: workspaceRegistry.allowedRoots.length,
+      gateway_app_dir_is_workspace: workspaceRegistry.repos.some(
+        repo => repo.path === join(homedir(), ".llm-cli-gateway")
+      ),
+    },
+    providers: Object.fromEntries(
+      CLI_TYPES.map(provider => [provider, doctorProviderStatus(providerStatuses[provider])])
+    ) as DoctorReport["providers"],
+    endpoint_exposure: endpointExposure,
+    remote_http_oauth: buildRemoteHttpOAuthReadiness({
+      oauthDiag,
+      workspace: remoteSafeWorkspaceSummary(workspaceRegistry),
+      auth,
+      transport,
+      publicUrl,
+      endpoint: endpointExposure,
+      mcpPath: env.LLM_GATEWAY_HTTP_PATH || "/mcp",
+    }),
+    client_config: clientConfigStatus(),
+    cache_awareness: buildCacheAwarenessReport(opts),
+    provider_capabilities: buildProviderCapabilitySummary(providerStatuses),
+    least_cost: buildLeastCostReport(leastCostConfig, generatedAt, opts.lcrPriors),
+    personal_config: personalConfigReadiness,
+    upstream,
+    next_actions: [],
+  };
+
+  // Slice 6: attach the api_providers block only when at least one API provider
+  // is enabled, so a CLI-only gateway's report is byte-identical to before.
+  const apiProviders = buildApiProviderHealthReport(opts, env);
+  if (apiProviders) {
+    report.api_providers = apiProviders;
+  }
+
+  // A recorder that could not open, or that is failing operations, is a
+  // FAILURE and not a configuration choice, so it lands on `ok` alongside the
+  // other real faults. `disabled` deliberately does not: the operator asked for
+  // it. Gated on `scanned` because a caller that ran no scan learned nothing.
+  if (
+    report.storage.scanned &&
+    (report.storage.flight_recorder.state === "unavailable" ||
+      report.storage.flight_recorder.state === "degraded")
+  ) {
+    report.ok = false;
+    report.next_actions.push(
+      `Flight recorder storage is ${report.storage.flight_recorder.state}: ${report.storage.flight_recorder.error ?? "no detail"}. Request history reads return empty results that are NOT evidence that no request ran.`
+    );
+  }
+  for (const warning of report.storage.warnings) {
+    if (warning.startsWith("The flight recorder's file also holds an ABANDONED")) {
+      report.next_actions.push(warning);
+    }
+  }
+  if (transport === "http" && auth.required && !auth.tokenConfigured) {
+    report.ok = false;
+    report.next_actions.push("Set LLM_GATEWAY_AUTH_TOKEN before starting HTTP transport.");
+  }
+  if (report.personal_config.enabled && !report.personal_config.ready) {
+    report.ok = false;
+    if (!report.personal_config.configuration_valid) {
+      report.next_actions.push(
+        "Repair the local [personal_config] configuration, then run doctor --json again."
+      );
+    } else if (!report.personal_config.baseline_present) {
+      report.next_actions.push(
+        "Initialize the local Personal Agent Config baseline with config_init, then publish and config_sync."
+      );
+    } else if (!report.personal_config.current_release_id) {
+      report.next_actions.push(
+        "Run config_sync locally to activate a verified Personal Agent Config release."
+      );
+    } else if (report.personal_config.stale) {
+      report.next_actions.push(
+        "Run config_sync locally, or use the bounded local config_ack_stale workflow."
+      );
+    } else if (!report.personal_config.durable_async_configured) {
+      report.next_actions.push(
+        "Personal Agent Config Kit requires [persistence] backend = sqlite or postgres with async jobs enabled."
+      );
+    } else if (!report.personal_config.claude_bare_auth_configured) {
+      report.next_actions.push(
+        "Set ANTHROPIC_API_KEY in the gateway process environment before using Claude Personal Agent Config Kit requests."
+      );
+    }
+  }
+  if (report.personal_config.enabled) {
+    // `ready` is the legacy Claude-gated aggregate, so a provider whose ONLY
+    // remaining blocker is its own credential would otherwise get no guidance
+    // at all once Claude is configured. Emit it per provider, skipping Claude
+    // when the block above already covered it.
+    for (const [provider, eligibility] of Object.entries(
+      report.personal_config.provider_eligibility
+    )) {
+      const credentialEnv = eligibility.required_credential_env;
+      if (
+        !eligibility.kit_supported ||
+        eligibility.eligible ||
+        credentialEnv === null ||
+        eligibility.required_credential_configured ||
+        eligibility.blockers.length !== 1
+      ) {
+        continue;
+      }
+      const action = `Set ${credentialEnv} in the gateway process environment before using ${getKitProviderLabel(provider as CliType)} Personal Agent Config Kit requests.`;
+      if (!report.next_actions.includes(action)) report.next_actions.push(action);
+    }
+  }
+  report.next_actions.push(...endpointExposure.next_actions);
+  for (const [name, provider] of Object.entries(report.providers)) {
+    if (!provider.cli_available) {
+      report.next_actions.push(provider.install_guidance.summary);
+    } else if (provider.login_status !== "authenticated") {
+      report.next_actions.push(`${name}: ${provider.login_guidance.summary}`);
+    }
+  }
+  // Mistral-specific: surface the session_logging toggle BEFORE a --continue/--resume
+  // request fails opaquely. The check is read-only; the gateway never mutates the file.
+  const vibeStatus = report.client_config.vibe_session_logging;
+  if (report.providers.mistral.cli_available && !vibeStatus.session_logging_enabled) {
+    report.next_actions.push(`mistral: ${vibeStatus.note}`);
+  }
+  // U27: surface Gemini config gaps (missing GEMINI.md, missing settings.json,
+  // MCP-server whitelist drift) only when Gemini CLI is actually installed.
+  if (report.providers.gemini.cli_available) {
+    for (const action of report.client_config.gemini_config.next_actions) {
+      report.next_actions.push(`gemini: ${action}`);
+    }
+  }
+  if (report.next_actions.length === 0) {
+    report.next_actions.push(
+      "Run a client setup guide and verify with doctor --json after each step."
+    );
+  }
+
+  // Upstream drift detection recommendation — surfaced for habitual use after provider upgrades.
+  const hasAnyCli = Object.values(report.providers).some(p => p.cli_available);
+  if (hasAnyCli) {
+    if (report.upstream.probed) {
+      report.next_actions.push(
+        "Upstream probe was run (see upstream.probe_report for installed vs declared drift)."
+      );
+    } else {
+      report.next_actions.push(
+        "After upgrading provider CLIs, check for contract drift: " +
+          report.upstream.how_to_check +
+          "  (add --probe-upstream to this doctor command for one-shot probing)"
+      );
+    }
+  }
+
+  // F4: whenever the installed probe actually ran, a subcommand/help probe that
+  // exited nonzero (help still parsed) or could not run leaves that CLI's
+  // contract unverified. Surface ONE specific advisory so it is visible without
+  // hand-scanning probe_report. Doctor stays advisory: report.ok is deliberately
+  // NOT flipped (matches the scanner's opt-in --require-installed). Gated on the
+  // probe having run, independent of hasAnyCli.
+  if (report.upstream.probed) {
+    const installedProbe =
+      (probeReport?.installedProbe as
+        Record<string, InstalledCliContractProbe> | null | undefined) ?? null;
+    if (installedProbe) {
+      const unverified = Object.entries(installedProbe)
+        .filter(
+          ([, probe]) =>
+            probe.helpExitedNonzero || Object.values(probe.subcommands).some(sub => !sub.available)
+        )
+        .map(([cli]) => cli);
+      if (unverified.length > 0) {
+        report.next_actions.push(
+          `re-probe ${unverified.join(", ")}: an installed help probe exited nonzero or could not run; its contract is unverified.`
+        );
+      }
+    }
+  }
+
+  return report;
+}
+
+export async function printDoctorJson(
+  opts: { probeUpstream?: boolean; probeApiProviders?: boolean } = {}
+): Promise<void> {
+  // Load cache-awareness config + open the flight recorder so the doctor
+  // command can populate cache_awareness.last_24h. Both are best-effort:
+  // failures degrade to the zeroed block (buildCacheAwarenessReport
+  // handles missing deps).
+  let cacheAwareness: CacheAwarenessConfig | undefined;
+  let flightRecorder: FlightRecorderLike | undefined;
+  let providersConfig: ProvidersConfig | undefined;
+  let leastCost: LeastCostConfig | undefined;
+  try {
+    cacheAwareness = loadCacheAwarenessConfig();
+  } catch {
+    // ignore
+  }
+  try {
+    leastCost = loadLeastCostConfig();
+  } catch {
+    // ignore
+  }
+  // The open failure is no longer ignored. It used to leave `flightRecorder`
+  // undefined, which produced the same zeroed cache_awareness block as a
+  // recorder that was never configured, and doctor said nothing either way.
+  const recorderDbPath = resolveFlightRecorderDbPath();
+  if (recorderDbPath) {
+    let persistence: PersistenceConfig | undefined;
+    try {
+      persistence = loadPersistenceConfig();
+    } catch {
+      // collectStorageHealth reports the invalid configuration separately.
+    }
+    if (persistence) {
+      flightRecorder = createFlightRecorder(
+        noopDoctorLogger,
+        persistence.backend,
+        persistence.roleDsns
+      );
+    }
+  }
+  try {
+    providersConfig = loadProvidersConfig();
+  } catch {
+    // ignore
+  }
+  // Slice 6: the reachability probe is opt-in. A normal `doctor --json` run
+  // spends no network or tokens; only `--probe-api-providers` opens a socket.
+  let apiReachability: Record<string, { reachable: boolean; error?: string }> | undefined;
+  if (opts.probeApiProviders && providersConfig) {
+    apiReachability = {};
+    for (const runtime of enabledApiProviders(providersConfig)) {
+      apiReachability[runtime.name] = await probeApiProviderReachability(runtime.baseUrl);
+    }
+  }
+  // The recorder is asynchronous since s7, so the two scans happen HERE and
+  // `createDoctorReport` stays a pure synchronous projection. Each read keeps
+  // the try/catch that used to sit inside the report builders, with the await
+  // INSIDE the try: a call that stopped throwing and started rejecting, inside
+  // a try whose catch can no longer fire, is the dead-catch class this
+  // programme has already shipped once.
+  let cacheStats: GlobalCacheStats | undefined;
+  if (flightRecorder) {
+    try {
+      cacheStats = await computeGlobalCacheStats(flightRecorder, { lastNHours: 24 });
+    } catch {
+      // Degrade to the zeroed cache_awareness block.
+    }
+  }
+  // Gated on priors_scope as well as on the recorder: readLcrPriorRows scans
+  // every request row, so reading it when learning is off would make `doctor`
+  // a full-table scan of a 1.2 GB file for a block it then discards.
+  const priorsScope = leastCost?.priorsScope ?? defaultLeastCostConfig().priorsScope;
+  let lcrPriors: LcrPriors | undefined;
+  if (flightRecorder && priorsScope !== "off") {
+    try {
+      lcrPriors = await computeLcrPriorsFromDb(flightRecorder, { priorsScope });
+    } catch {
+      // Degrade to an empty calibrationQuality array.
+    }
+  }
+  // Scanned with the recorder already open above, so the report carries one
+  // recorder's state rather than two independent openings of one file.
+  const storage = await collectStorageHealth(flightRecorder ?? null);
+  const report = createDoctorReport({
+    env: process.env,
+    storage,
+    cacheAwareness,
+    cacheStats,
+    lcrPriors,
+    probeUpstream: opts.probeUpstream,
+    providersConfig,
+    apiReachability,
+    leastCost,
+  });
+  process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+  if (flightRecorder) {
+    try {
+      await flightRecorder.close();
+    } catch {
+      // best effort
+    }
+  }
+}
+
+/**
+ * Slice 6: opt-in reachability probe for an API-provider base URL. Issues a
+ * bare GET and treats ANY HTTP response (including 401/404) as reachable: the
+ * goal is connectivity, not auth or token spend. No request body, no API key,
+ * no completion call. https for remote, http for loopback test endpoints.
+ */
+export async function probeApiProviderReachability(
+  baseUrl: string,
+  timeoutMs = 5_000
+): Promise<{ reachable: boolean; error?: string }> {
+  let url: URL;
+  try {
+    url = new URL(baseUrl);
+  } catch {
+    return { reachable: false, error: "invalid base_url" };
+  }
+  const transport =
+    url.protocol === "http:" ? await import("node:http") : await import("node:https");
+  return new Promise(resolve => {
+    const request = transport.request(url, { method: "GET", timeout: timeoutMs }, response => {
+      // Any status code means the endpoint answered: drain and resolve.
+      response.resume();
+      resolve({ reachable: true });
+    });
+    request.on("timeout", () => {
+      request.destroy();
+      resolve({ reachable: false, error: `timed out after ${timeoutMs}ms` });
+    });
+    request.on("error", err => {
+      resolve({ reachable: false, error: err instanceof Error ? err.message : String(err) });
+    });
+    request.end();
+  });
+}
+
+function isCreateDoctorReportOptions(
+  value: NodeJS.ProcessEnv | CreateDoctorReportOptions
+): value is CreateDoctorReportOptions {
+  // CreateDoctorReportOptions carries either `env` (an object) or
+  // `cacheStats` (an object). A NodeJS.ProcessEnv is a flat
+  // Record<string, string|undefined> — even if a shell happens to export
+  // `env=production` or `cacheStats=...`, the value at that key is a
+  // STRING, not an object, so the typeof checks here cannot collide.
+  //
+  // s7 renamed the discriminating key from `flightRecorder` to `cacheStats`
+  // along with the option itself; a key nothing reads is exactly the inert
+  // config key this repository has shipped before.
+  if (value === null || typeof value !== "object") return false;
+  if (Object.prototype.hasOwnProperty.call(value, "cacheStats")) {
+    const candidate = (value as { cacheStats?: unknown }).cacheStats;
+    return candidate === undefined || typeof candidate === "object";
+  }
+  if (Object.prototype.hasOwnProperty.call(value, "leastCost")) {
+    // Same reasoning as flightRecorder: an options object may carry only
+    // `leastCost` (a LeastCostConfig object). A stray env var `leastCost=...`
+    // would be a STRING, so the typeof-object check cannot collide.
+    const candidate = (value as { leastCost?: unknown }).leastCost;
+    return candidate === undefined || typeof candidate === "object";
+  }
+  if (Object.prototype.hasOwnProperty.call(value, "personalConfigReadiness")) {
+    const candidate = (value as { personalConfigReadiness?: unknown }).personalConfigReadiness;
+    return candidate === undefined || (candidate !== null && typeof candidate === "object");
+  }
+  if (Object.prototype.hasOwnProperty.call(value, "env")) {
+    const candidate = (value as { env?: unknown }).env;
+    return candidate === undefined || typeof candidate === "object";
+  }
+  return false;
+}
+
+function doctorProviderStatus(
+  provider: ProviderRuntimeStatus
+): DoctorReport["providers"]["claude"] {
+  return {
+    cli_available: provider.installed,
+    version: provider.version,
+    login_status: provider.loginStatus,
+    version_command: provider.versionCommand,
+    login_check: {
+      method: provider.loginCheck.method,
+      command: provider.loginCheck.command,
+      credential_store: provider.loginCheck.credentialStore,
+      detail: provider.loginCheck.detail,
+    },
+    install_guidance: {
+      summary: provider.guidance.install.summary,
+      commands: provider.guidance.install.commands,
+      documentation_url: provider.guidance.install.documentationUrl,
+    },
+    login_guidance: {
+      summary: provider.guidance.login.summary,
+      commands: provider.guidance.login.commands,
+      credential_handling: provider.guidance.login.credentialHandling,
+    },
+  };
+}

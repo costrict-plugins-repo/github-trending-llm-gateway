@@ -1,0 +1,626 @@
+import { describe, expect, it } from "vitest";
+import { buildServerInstructions, createGatewayServer } from "../index.js";
+import type { PersistenceConfig } from "../config.js";
+import { CLI_TYPES } from "../provider-types.js";
+
+async function makeServer(asyncJobsEnabled: boolean) {
+  const { AsyncJobManager } = await import("../async-job-manager.js");
+  const { MemoryJobStore } = await import("../job-store.js");
+  const { noopLogger } = await import("../logger.js");
+  const manager = new AsyncJobManager(
+    noopLogger,
+    undefined,
+    asyncJobsEnabled ? new MemoryJobStore() : undefined
+  );
+  const persistence: PersistenceConfig = asyncJobsEnabled
+    ? {
+        backend: "sqlite",
+        logsDbPath: ":memory:",
+        jobsDbPath: ":memory:",
+        jobRetentionDays: 7,
+        dedupWindowMs: 0,
+        asyncJobsEnabled: true,
+        sources: { configFile: null, envOverrides: [] },
+      }
+    : {
+        backend: "none",
+        logsDbPath: ":memory:",
+        jobsDbPath: ":memory:",
+        jobRetentionDays: 7,
+        dedupWindowMs: 0,
+        asyncJobsEnabled: false,
+        sources: { configFile: null, envOverrides: [] },
+      };
+  return createGatewayServer({ asyncJobManager: manager, persistence });
+}
+
+/**
+ * Verbs that put a session row in a caller's hands.
+ *
+ * Round 4 got past the previous list twice with ordinary English: "hands back"
+ * and "leak through" are the same claim as "returns", and neither was here.
+ * The list is the detector's whole reach, so it is spelled out once and both
+ * directions of the self-test read from it.
+ */
+const HANDS_TO_CALLER = String.raw`(returns?|exposes?|reveals?|surfaces?|lists?|hands?(\s+\w+)?\s+back|hands?\s+back|hands?|leaks?|yields?|gives?(\s+\w+)?\s+back|shows?|includes?)`;
+
+/**
+ * A claim that a caller-facing read hands back a tombstone.
+ *
+ * This matches PHRASES, and a phrase gate is not a truth gate: it cannot know
+ * whether a sentence is true, only whether it is shaped like the specific
+ * falsehood the behaviour suite disproves. Two consequences are load-bearing
+ * and neither is fixed by widening it further. It misses any paraphrase not
+ * built from these verbs. And it would flag a TRUE sentence built from them,
+ * which is why the owning-host listing -- the one API that really does return
+ * tombstones -- is excluded by name rather than by hoping no one writes it.
+ * The behaviour suite is what establishes the behaviour; this only stops the
+ * documentation drifting into stating the opposite.
+ */
+const OWNING_HOST_LISTING = /listPendingWorktreeCleanupSessions/i;
+const TOMBSTONE_VISIBILITY_CLAIM = new RegExp(
+  [
+    String.raw`\b` + HANDS_TO_CALLER + String.raw`\b[^.]{0,60}\b(cleanup\s+)?tombstones?\b`,
+    String.raw`\b` + HANDS_TO_CALLER + String.raw`\b[^.]{0,60}\bdeleted\s+sessions?\b`,
+    String.raw`\b((cleanup\s+)?tombstones?|deleted\s+sessions?)\b[^.]{0,60}\b(are|is|remain|stay)s?\s+(visible|readable|available)\b`,
+    String.raw`\b((cleanup\s+)?tombstones?|deleted\s+sessions?)\b[^.]{0,60}\b(leak|leaks|come|comes)\s+(back\s+)?(through|out\s+of)\b`,
+  ].join("|"),
+  "i"
+);
+const TOMBSTONE_VISIBILITY_LIE = {
+  test: (sentence: string): boolean =>
+    !OWNING_HOST_LISTING.test(sentence) && TOMBSTONE_VISIBILITY_CLAIM.test(sentence),
+};
+
+describe("the contradiction detector itself", () => {
+  // Gutting the regex left this suite 12/12 green, so the pattern was asserted
+  // by nothing. It is a narrow detector and its narrowness is the point, but
+  // its narrowness has to be measured rather than assumed.
+  it("matches the claims that contradict the behaviour suite", () => {
+    for (const lie of [
+      "PostgreSQL getSession still returns tombstones to callers.",
+      "session_get exposes cleanup tombstones to callers.",
+      "Deleted sessions are visible through session_list.",
+      "session_get returns a deleted session until cleanup completes.",
+      // Round 4 wrote both of these past the previous pattern.
+      "session_get hands cleanup tombstones back to callers.",
+      "getSession still hands back a tombstone.",
+      "Tombstones leak through session_get.",
+      "Tombstones remain visible to getSession.",
+    ]) {
+      expect(TOMBSTONE_VISIBILITY_LIE.test(lie), lie).toBe(true);
+    }
+  });
+
+  it("does not match the true statements the descriptions actually make", () => {
+    for (const truth of [
+      "Both managers stage a caller-hidden cleanup tombstone before cleanup runs.",
+      "A tombstone is not bounded by retention.",
+      "Deletion processed by a different host removes no worktree.",
+      // True, and built from the detector's own verbs: the owning-host listing
+      // is the one read that really does return tombstones.
+      "listPendingWorktreeCleanupSessions lists cleanup tombstones for the owning host.",
+    ]) {
+      expect(TOMBSTONE_VISIBILITY_LIE.test(truth), truth).toBe(false);
+    }
+  });
+});
+
+describe("MCP tool-surface usability (post-usability-review regressions)", () => {
+  it("every registered tool carries a clear description (>= 20 chars, per .cursorrules)", async () => {
+    const server = await makeServer(true);
+    const registry = (server as unknown as Record<string, Record<string, { description?: string }>>)
+      ._registeredTools;
+    const names = Object.keys(registry);
+    expect(names.length).toBeGreaterThanOrEqual(40);
+    for (const name of names) {
+      const desc = registry[name].description ?? "";
+      expect(desc.length, `${name} description present and >= 20 chars`).toBeGreaterThanOrEqual(20);
+    }
+  });
+
+  it("job_status/job_result descriptions disambiguate from llm_job_* (validation vs provider jobs)", async () => {
+    const server = await makeServer(true);
+    const registry = (server as unknown as Record<string, Record<string, { description?: string }>>)
+      ._registeredTools;
+    expect(registry["job_status"].description).toMatch(/VALIDATION/);
+    expect(registry["job_status"].description).toMatch(/llm_job_status/);
+    expect(registry["job_result"].description).toMatch(/VALIDATION/);
+    expect(registry["job_result"].description).toMatch(/llm_job_result/);
+    expect(registry["compare_answers"].description).toMatch(/does not call any provider/i);
+  });
+
+  it("session_delete describes the different worktree cleanup guarantees", async () => {
+    const server = await makeServer(true);
+    const registry = (server as unknown as Record<string, Record<string, { description?: string }>>)
+      ._registeredTools;
+    const description = registry["session_delete"].description ?? "";
+
+    expect(description).toMatch(/tool result confirms record deletion/i);
+    expect(description).toMatch(/cleanup observers run asynchronously/i);
+    expect(description).toMatch(/file-backed and PostgreSQL session managers/i);
+    expect(description).toMatch(
+      /[Bb]oth managers stage a caller-hidden cleanup tombstone before cleanup runs and retain a failed removal for retry by the host that owns the worktree/i
+    );
+    expect(description).toMatch(
+      /finalizing the record only once Git no longer registers the worktree, read back rather than inferred/i
+    );
+    expect(description).toMatch(/file-backed TTL eviction uses the same tombstone retry path/i);
+    expect(description).toMatch(
+      /[Dd]eletion processed by a different host removes no worktree and leaves the owning host's record intact/i
+    );
+    expect(description).toMatch(
+      /cleanup_expired_sessions function stages the same tombstone instead of deleting a worktree-bearing session/i
+    );
+    expect(description).toMatch(/tombstone is not bounded by retention/i);
+    // The corrected claim must not survive alongside the one it replaced.
+    expect(description).not.toMatch(/not retained for automatic retry/i);
+    expect(description).not.toMatch(/performs no worktree cleanup/i);
+    // These gates check that a phrase is present or absent; they cannot check
+    // that a paragraph is TRUE, and a reviewer proved it by inserting a false
+    // sentence that passed. This is the narrow class that IS checkable: a claim
+    // that a deleted session is still visible contradicts the suite directly.
+    expect(TOMBSTONE_VISIBILITY_LIE.test(description), description).toBe(false);
+  });
+
+  it("session_clear_all describes its per-session worktree cleanup guarantees", async () => {
+    const server = await makeServer(true);
+    const registry = (server as unknown as Record<string, Record<string, { description?: string }>>)
+      ._registeredTools;
+    const description = registry["session_clear_all"].description ?? "";
+
+    expect(description).toMatch(/tool result confirms record deletion/i);
+    expect(description).toMatch(/cleanup observers run asynchronously/i);
+    expect(description).toMatch(/file-backed and PostgreSQL session managers/i);
+    expect(description).toMatch(
+      /[Bb]oth managers stage a caller-hidden cleanup tombstone before cleanup runs and retain a failed removal for retry by the host that owns the worktree/i
+    );
+    expect(description).toMatch(
+      /finalizing the record only once Git no longer registers the worktree, read back rather than inferred/i
+    );
+    expect(description).toMatch(/file-backed TTL eviction uses the same tombstone retry path/i);
+    expect(description).toMatch(
+      /[Dd]eletion processed by a different host removes no worktree and leaves the owning host's record intact/i
+    );
+    expect(description).toMatch(
+      /cleanup_expired_sessions function stages the same tombstone instead of deleting a worktree-bearing session/i
+    );
+    expect(description).toMatch(/tombstone is not bounded by retention/i);
+    expect(description).not.toMatch(/not retained for automatic retry/i);
+    expect(description).not.toMatch(/performs no worktree cleanup/i);
+    expect(TOMBSTONE_VISIBILITY_LIE.test(description), description).toBe(false);
+  });
+
+  it("workspace tools are described as remote-only and not a stdio path-access fallback", async () => {
+    const server = await makeServer(true);
+    const registry = (server as unknown as Record<string, Record<string, { description?: string }>>)
+      ._registeredTools;
+
+    for (const name of [
+      "workspace_list",
+      "workspace_get",
+      "workspace_create",
+      "workspace_register_existing_repo",
+    ]) {
+      const desc = registry[name].description ?? "";
+      expect(desc, `${name} must say it is for remote workspaces`).toMatch(/remote HTTP\/OAuth/i);
+      expect(desc, `${name} must warn stdio callers away`).toMatch(/stdio\/local/i);
+      expect(desc, `${name} must not be a path-access repair tool`).toMatch(/not|do not/i);
+    }
+  });
+
+  it("provider path fields warn stdio callers not to use workspace tools as a fallback", async () => {
+    const server = await makeServer(true);
+    const registry = (
+      server as unknown as Record<string, Record<string, { inputSchema?: unknown }>>
+    )._registeredTools;
+    const shapeFor = (
+      name: string
+    ): Record<string, { _def?: { description?: string; innerType?: unknown } }> => {
+      const schema = registry[name].inputSchema as {
+        _def?: { shape?: () => Record<string, unknown> };
+      };
+      return (schema._def?.shape?.() ?? {}) as Record<
+        string,
+        { _def?: { description?: string; innerType?: unknown } }
+      >;
+    };
+
+    for (const [toolName, fieldName] of [
+      ["claude_request", "addDir"],
+      ["claude_request_async", "addDir"],
+      ["codex_request", "workingDir"],
+      ["codex_request", "addDir"],
+      ["codex_request_async", "workingDir"],
+      ["codex_request_async", "addDir"],
+      ["gemini_request", "includeDirs"],
+      ["gemini_request_async", "includeDirs"],
+      ["grok_request_async", "workingDir"],
+      ["mistral_request", "workingDir"],
+      ["mistral_request", "addDir"],
+      ["mistral_request_async", "workingDir"],
+      ["mistral_request_async", "addDir"],
+    ]) {
+      const desc = shapeFor(toolName)[fieldName]?._def?.description ?? "";
+      expect(desc, `${toolName}.${fieldName} must mention stdio/local`).toMatch(/stdio\/local/i);
+      expect(desc, `${toolName}.${fieldName} must reject workspace fallback`).toMatch(
+        /do not call workspace_\*/i
+      );
+    }
+
+    for (const toolName of [
+      "claude_request",
+      "claude_request_async",
+      "codex_request",
+      "codex_request_async",
+      "codex_fork_session",
+      "gemini_request",
+      "gemini_request_async",
+      "grok_request",
+      "grok_request_async",
+      "mistral_request",
+      "mistral_request_async",
+    ]) {
+      const desc = shapeFor(toolName).workspace?._def?.description ?? "";
+      expect(desc, `${toolName}.workspace must be remote-only`).toMatch(/remote HTTP\/OAuth/i);
+      expect(desc, `${toolName}.workspace must warn stdio callers away`).toMatch(/stdio\/local/i);
+      expect(desc, `${toolName}.workspace must reject workspace fallback`).toMatch(
+        /do not use this field/i
+      );
+    }
+  });
+
+  it("pins complete Codex and Claude native-continuation target semantics", async () => {
+    const server = await makeServer(true);
+    const registry = (
+      server as unknown as Record<string, Record<string, { inputSchema?: unknown }>>
+    )._registeredTools;
+    const descriptionFor = (toolName: string, fieldName: string): string => {
+      const schema = registry[toolName].inputSchema as {
+        _def?: { shape?: () => Record<string, unknown> };
+      };
+      const shape = (schema._def?.shape?.() ?? {}) as Record<
+        string,
+        { _def?: { description?: string } }
+      >;
+      return shape[fieldName]?._def?.description ?? "";
+    };
+
+    for (const toolName of ["codex_request", "codex_request_async"]) {
+      const description = descriptionFor(toolName, "resumeLatest");
+      // This ratchet previously required the description to claim `--last` is
+      // the GLOBAL selector, that the resumed session inherits its original
+      // cwd, and that workingDir/addDir cannot retarget it. All three are false
+      // against codex-cli 0.145.0 and the current spawn path, so the test was
+      // holding a false contract in place: `--last` is cwd-filtered upstream
+      // unless `--all` is passed (the gateway never emits it), and the child is
+      // spawned with the gateway-resolved cwd even though `-C` is dropped from
+      // the resume argv.
+      //
+      // Whether the code or the documented contract is wrong is #258. Until
+      // that is decided, pin the interim contract instead: the description must
+      // warn rather than promise, so neither outcome of #258 is foreclosed.
+      // Deliberately not keyed on the internal ticket number: these
+      // descriptions ship to npm consumers who cannot see that tracker.
+      expect(description, `${toolName}.resumeLatest must flag the open question`).toMatch(
+        /under review/i
+      );
+      expect(description, `${toolName}.resumeLatest must not promise a target`).toMatch(
+        /do not rely on/i
+      );
+      // "under review" plus a disclaimer is not enough on its own: a
+      // description could warn generically and still assert inheritance in the
+      // next sentence. Pin BOTH uncertainties by name, so a future edit cannot
+      // drop one and keep the reassuring preamble.
+      expect(
+        description,
+        `${toolName}.resumeLatest must name the session-selection uncertainty`
+      ).toMatch(/which session/i);
+      expect(
+        description,
+        `${toolName}.resumeLatest must name the working-directory uncertainty`
+      ).toMatch(/working directory/i);
+      expect(
+        description,
+        `${toolName}.resumeLatest must not reassert the global-selector claim`
+      ).not.toMatch(/globally latest/i);
+      // There is deliberately NO regex here forbidding affirmative inheritance
+      // phrasing. Two attempts failed in both directions, verified by probe:
+      // `/(?<!never |not |n't )inherits[^.]*original/i` let the affirmative
+      // "keeps its original cwd and workingDir cannot retarget it" through
+      // (it never says "inherits"), while wrongly rejecting the safe denials
+      // "Do not assume a resumed session inherits its original cwd" and
+      // "Whether it inherits its original cwd is unresolved".
+      //
+      // Blacklisting natural-language assertions is a losing game. The positive
+      // requirements above are the robust part: a description that names both
+      // uncertainties and says not to rely on them cannot also promise
+      // inheritance without contradicting itself, and a self-contradicting
+      // description is a review problem, not a regex problem. `globally latest`
+      // stays banned below because it is one specific stable phrase that was
+      // the actual prior claim, not an open-ended category.
+      expect(description, `${toolName}.resumeLatest must explain explicit UUID targeting`).toMatch(
+        /explicit real Codex UUID targets that session/i
+      );
+    }
+
+    for (const toolName of ["claude_request", "claude_request_async"]) {
+      const description = descriptionFor(toolName, "continueSession");
+      expect(description, `${toolName}.continueSession must require stable selection`).toMatch(
+        /stable workspace selection is required/i
+      );
+      expect(description, `${toolName}.continueSession must name workingDir`).toMatch(/workingDir/);
+      expect(description, `${toolName}.continueSession must name registered workspace`).toMatch(
+        /registered workspace/i
+      );
+      expect(description, `${toolName}.continueSession must name configured default`).toMatch(
+        /configured default workspace/i
+      );
+    }
+  });
+
+  it("pins the gateway-owned worktree materialization side-effect boundary", async () => {
+    const server = await makeServer(true);
+    const registry = (
+      server as unknown as Record<string, Record<string, { inputSchema?: unknown }>>
+    )._registeredTools;
+
+    const worktreeTools = Object.entries(registry).flatMap(([toolName, registered]) => {
+      const schema = registered.inputSchema as
+        { _def?: { shape?: () => Record<string, unknown> } } | undefined;
+      const shape = (schema?._def?.shape?.() ?? {}) as Record<
+        string,
+        { _def?: { description?: string } }
+      >;
+      return shape.worktree
+        ? [{ toolName, description: shape.worktree._def?.description ?? "" }]
+        : [];
+    });
+    const expectedWorktreeTools = CLI_TYPES.filter(provider => provider !== "cursor")
+      .flatMap(provider => [`${provider}_request`, `${provider}_request_async`])
+      .sort();
+    expect(worktreeTools.map(({ toolName }) => toolName).sort()).toEqual(expectedWorktreeTools);
+
+    for (const { toolName, description } of worktreeTools) {
+      expect(description, `${toolName}.worktree must pin hook suppression`).toMatch(
+        /repository, system, and global Git hooks/i
+      );
+      expect(description, `${toolName}.worktree must pin checkout filter suppression`).toMatch(
+        /clean, smudge, and process checkout filters/i
+      );
+      expect(description, `${toolName}.worktree must explain Git LFS representation`).toMatch(
+        /Git LFS remains in its repository representation/i
+      );
+      expect(description, `${toolName}.worktree must reject host-command execution claims`).toMatch(
+        /instead of executing host commands/i
+      );
+      expect(description, `${toolName}.worktree must support both session managers`).toMatch(
+        /file-backed and PostgreSQL session managers/i
+      );
+      expect(description, `${toolName}.worktree must keep filesystem ownership host-local`).toMatch(
+        /limited to the owning host/i
+      );
+      expect(description, `${toolName}.worktree must scope TTL eviction to the file store`).toMatch(
+        /file-backed manager[^.]*TTL eviction|file-backed TTL eviction/i
+      );
+      expect(description, `${toolName}.worktree must qualify cleanup retry timing`).toMatch(
+        /retried when a manager is registered on the owning host/i
+      );
+      expect(description, `${toolName}.worktree must say the record outlives a failure`).toMatch(
+        /finalized only once Git no longer registers the worktree, which is read back rather than inferred/i
+      );
+      expect(
+        description,
+        `${toolName}.worktree must say that failing to look is not a removal`
+      ).toMatch(/whose owner marker cannot be read, is not a removal/i);
+      expect(description, `${toolName}.worktree must scope retry to the owning host`).toMatch(
+        /[Dd]eletion processed by another host removes no worktree and leaves the owning host's record intact/i
+      );
+      expect(description, `${toolName}.worktree must cover bulk deletion`).toMatch(
+        /session_clear_all/i
+      );
+      expect(description, `${toolName}.worktree must cover database-side expiry`).toMatch(
+        /cleanup_expired_sessions function stages the same tombstone/i
+      );
+      expect(description, `${toolName}.worktree must state the tombstone is unbounded`).toMatch(
+        /tombstone is not bounded by retention/i
+      );
+      expect(
+        description,
+        `${toolName}.worktree must not keep the claim #305 falsified`
+      ).not.toMatch(/not retained for automatic retry|performs no worktree cleanup/i);
+      expect(
+        description,
+        `${toolName}.worktree must not restore the obsolete engine gate`
+      ).not.toMatch(
+        /require the local file-backed session manager|fail closed with PostgreSQL sessions/i
+      );
+    }
+  });
+
+  it("server instructions advertise async/job tools only when they are registered", () => {
+    const withAsync = buildServerInstructions(true);
+    expect(withAsync).toContain("*_request_async");
+    expect(withAsync).toContain("llm_job_status");
+    expect(withAsync).toContain("llm_job_watch");
+    expect(withAsync).toContain("review_changes");
+    expect(withAsync).toContain("auto-defers");
+    expect(withAsync).toContain("do not use workspace_*");
+    expect(withAsync).toContain("Stdio/local provider calls may pass local workingDir");
+    expect(withAsync).toContain("Codex new and resume prompts use stdin.");
+    expect(withAsync).toContain("codex_fork_session remains argv-bound");
+    expect(withAsync).not.toContain("Codex prompts use stdin.");
+    expect(withAsync).not.toContain("${SYNC_DEADLINE_MS}"); // interpolation regression guard
+
+    const withoutAsync = buildServerInstructions(false);
+    // The "(async)" advertisement must be gone; the DISABLED note may still
+    // NAME the tools to explain that they are not registered.
+    expect(withoutAsync).not.toContain("*_request_async (async)");
+    expect(withoutAsync).toContain("not registered");
+    expect(withoutAsync).not.toContain("Jobs: llm_job_status");
+    expect(withoutAsync).not.toContain("review_changes");
+    expect(withoutAsync).toContain("DISABLED");
+    expect(withoutAsync).toContain("no auto-deferral");
+  });
+
+  it("does not advertise validation tools when Kit mode leaves them unregistered", () => {
+    const kitInstructions = buildServerInstructions(true, false, false);
+    expect(kitInstructions).toContain("validation tools are not registered");
+    expect(kitInstructions).not.toContain("validate_with_models");
+    expect(kitInstructions).not.toContain("second_opinion");
+  });
+
+  it("backend=none registers no async/job tools (structural invariant, client-visible)", async () => {
+    const server = await makeServer(false);
+    const registry = (server as unknown as Record<string, Record<string, unknown>>)
+      ._registeredTools;
+    for (const absent of [
+      "claude_request_async",
+      "codex_request_async",
+      "gemini_request_async",
+      "grok_request_async",
+      "mistral_request_async",
+      "llm_job_status",
+      "llm_job_watch",
+      "llm_job_result",
+      "llm_job_cancel",
+    ]) {
+      expect(registry[absent], `${absent} must NOT be registered on backend=none`).toBeUndefined();
+    }
+  });
+
+  it("every tool carries annotations: title + behavioural hints (2.3.0 slice)", async () => {
+    const server = await makeServer(true);
+    const registry = (
+      server as unknown as Record<
+        string,
+        Record<
+          string,
+          {
+            annotations?: {
+              title?: string;
+              readOnlyHint?: boolean;
+              destructiveHint?: boolean;
+              idempotentHint?: boolean;
+              openWorldHint?: boolean;
+            };
+          }
+        >
+      >
+    )._registeredTools;
+    const names = Object.keys(registry);
+    expect(names.length).toBeGreaterThanOrEqual(44); /* exact toBe(44) asserted below */
+    for (const name of names) {
+      const ann = registry[name].annotations;
+      expect(ann, `${name} has annotations`).toBeDefined();
+      expect((ann?.title ?? "").length, `${name} has a display title`).toBeGreaterThan(2);
+      // a tool cannot be both read-only and destructive
+      expect(
+        ann?.readOnlyHint === true && ann?.destructiveHint === true,
+        `${name} readOnly+destructive contradiction`
+      ).toBe(false);
+    }
+    // EXACT set pinning (post-2.3.0-gate Codex finding): derive the actual
+    // sets from the registry and compare them exactly — positive membership
+    // alone would let a future mis-classified or unlisted tool slip through.
+    expect(names.length).toBe(63);
+    const setOf = (pred: (a: NonNullable<(typeof registry)[string]["annotations"]>) => boolean) =>
+      names.filter(n => pred(registry[n].annotations!)).sort();
+    expect(setOf(a => a.readOnlyHint === true)).toEqual(
+      [
+        "approval_list",
+        "cli_versions",
+        "compare_answers",
+        "config_status",
+        "job_result",
+        "job_status",
+        "list_available_models",
+        "list_models",
+        "llm_job_result",
+        "llm_job_status",
+        "llm_job_watch",
+        "llm_process_health",
+        "llm_request_list",
+        "llm_request_result",
+        "explain_effective_config",
+        "provider_tool_capabilities",
+        "provider_subcommand_contract",
+        "provider_subcommand_drift",
+        "provider_subcommands_list",
+        "provider_version_guard",
+        "provider_admin_list",
+        "provider_admin_run",
+        "session_get",
+        "session_list",
+        "upstream_contracts",
+        "workspace_get",
+        "workspace_list",
+      ].sort()
+    );
+    expect(setOf(a => a.openWorldHint === true)).toEqual(
+      [
+        "claude_request",
+        "claude_request_async",
+        "codex_request",
+        "codex_request_async",
+        "codex_fork_session",
+        "cursor_request",
+        "cursor_request_async",
+        "devin_request",
+        "devin_request_async",
+        "gemini_request",
+        "gemini_request_async",
+        "grok_request",
+        "grok_request_async",
+        "mistral_request",
+        "mistral_request_async",
+        "validate_with_models",
+        "second_opinion",
+        "red_team_review",
+        "consensus_check",
+        "ask_model",
+        "synthesize_validation",
+        "cli_upgrade",
+        // Only openWorld entry that is NOT destructive: it reaches vendor
+        // registries to ask whether a newer CLI exists and changes nothing.
+        "provider_version_guard",
+      ].sort()
+    );
+    expect(setOf(a => a.destructiveHint === true)).toEqual(
+      [
+        // provider-spawning (19)
+        "claude_request",
+        "claude_request_async",
+        "codex_request",
+        "codex_request_async",
+        "codex_fork_session",
+        "cursor_request",
+        "cursor_request_async",
+        "devin_request",
+        "devin_request_async",
+        "gemini_request",
+        "gemini_request_async",
+        "grok_request",
+        "grok_request_async",
+        "mistral_request",
+        "mistral_request_async",
+        "validate_with_models",
+        "second_opinion",
+        "red_team_review",
+        "consensus_check",
+        "ask_model",
+        "synthesize_validation",
+        // gateway-destructive (4)
+        "cli_upgrade",
+        "config_init",
+        "config_recover_kit_attempt",
+        "llm_job_cancel",
+        "session_delete",
+        "session_clear_all",
+        "workspace_create",
+        // provider admin mutating (1)
+        "provider_admin_mutate",
+      ].sort()
+    );
+  });
+});

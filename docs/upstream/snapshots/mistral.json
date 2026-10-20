@@ -1,0 +1,102 @@
+{
+  "schemaVersion": "upstream-scan-snapshot.v2",
+  "cli": "mistral",
+  "fetchedAt": "2026-09-09T00:26:20.605Z",
+  "sources": [
+    {
+      "url": "https://api.github.com/repos/mistralai/mistral-vibe/releases/latest",
+      "ok": true,
+      "status": 200,
+      "bytes": 20006,
+      "sha256": "9e73596396db3977bb3f12e49a682ae4b2f11bc8bf35ddd739496b8573491974",
+      "semantic": {
+        "kind": "github-release.v1",
+        "sha256": "9d746cfb2fd3055a549832f671c0b08bcecc48907b6369a512006ab0cc87c182",
+        "fields": {
+          "tagName": "v2.19.1",
+          "name": "v2.19.1",
+          "draft": false,
+          "prerelease": false,
+          "publishedAt": "2026-07-09T11:39:15Z",
+          "targetCommitish": "30792a4cac2c2e5173c6b5a98739fbbf36324545",
+          "bodySha256": "f66e2414b5745d680c297ae0f225e9f24c35b26808bf41ab3670b57bfca6ac33"
+        }
+      }
+    }
+  ],
+  "helpSurface": {
+    "probedAt": "2026-09-09T00:26:19.135Z",
+    "available": true,
+    "version": "vibe 2.25.0",
+    "targetVersion": "vibe 2.25.0",
+    "versionMatchesTarget": true,
+    "discoveredFlags": [
+      "--add-dir",
+      "--agent",
+      "--auto-approve",
+      "--check-upgrade",
+      "--continue",
+      "--disabled-tools",
+      "--enabled-tools",
+      "--max-price",
+      "--max-tokens",
+      "--max-turns",
+      "--output",
+      "--prompt",
+      "--resume",
+      "--setup",
+      "--trust",
+      "--version",
+      "--workdir",
+      "--worktree",
+      "--yolo"
+    ],
+    "helpHash": "99e4186bb84bbdb1dab84e4a44b0a86d47de17b49d20f6bbfc599e6eaa7b6cb3",
+    "extraVsContract": [],
+    "missingFromBinary": [],
+    "arityMismatches": [],
+    "enumMismatches": []
+  },
+  "rootCommands": [
+    "mcp",
+    "update"
+  ],
+  "subcommands": {
+    "mcp": {
+      "commandPath": [
+        "mcp"
+      ],
+      "probedAt": "2026-09-09T00:26:19.099Z",
+      "available": true,
+      "existence": "present",
+      "discoveredFlags": [],
+      "helpHash": "054cf0998787d73ecc9e51befa7e3760aa8899d8106054ecfd2d4587af12196b",
+      "extraVsContract": [],
+      "missingFromBinary": [],
+      "arityMismatches": [],
+      "enumMismatches": [],
+      "risk": "writes_local_config",
+      "exposure": "not_exposed",
+      "tier": "catalog",
+      "summary": "Manage MCP server configuration (vibe mcp add/remove)."
+    },
+    "update": {
+      "commandPath": [
+        "update"
+      ],
+      "probedAt": "2026-09-09T00:26:19.135Z",
+      "available": false,
+      "existence": "present",
+      "discoveredFlags": [],
+      "helpHash": "99e4186bb84bbdb1dab84e4a44b0a86d47de17b49d20f6bbfc599e6eaa7b6cb3",
+      "extraVsContract": [],
+      "missingFromBinary": [],
+      "arityMismatches": [],
+      "enumMismatches": [],
+      "risk": "updates_binary",
+      "exposure": "not_exposed",
+      "tier": "catalog",
+      "summary": "Check for a Vibe update now (same as --check-upgrade)."
+    }
+  }
+}

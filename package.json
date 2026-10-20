@@ -1,0 +1,197 @@
+{
+  "name": "llm-cli-gateway",
+  "version": "3.2.1",
+  "publicSiteVersion": "3.2.1",
+  "mcpName": "io.github.verivus-oss/llm-cli-gateway",
+  "description": "Secure local control plane for AI coding agents across supported MCP clients, with workspace-scoped remote access, approval gates, durable jobs, sessions, and audit receipts.",
+  "license": "MIT",
+  "author": "VerivusAI Labs (https://github.com/verivus-oss)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/verivus-oss/llm-cli-gateway.git"
+  },
+  "homepage": "https://github.com/verivus-oss/llm-cli-gateway#readme",
+  "bugs": {
+    "url": "https://github.com/verivus-oss/llm-cli-gateway/issues"
+  },
+  "keywords": [
+    "mcp",
+    "llm",
+    "claude",
+    "codex",
+    "gemini",
+    "orchestration",
+    "control-plane",
+    "model-context-protocol",
+    "ai",
+    "cli-gateway"
+  ],
+  "type": "module",
+  "main": "dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./gateway-server": {
+      "types": "./dist/gateway-server.d.ts",
+      "default": "./dist/gateway-server.js"
+    }
+  },
+  "bin": {
+    "llm-cli-gateway": "dist/index.js"
+  },
+  "engines": {
+    "node": ">=24.4.0"
+  },
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.d.ts",
+    "!dist/__tests__/**",
+    "seed/provider-seed.json",
+    "seed/capability-floor.json",
+    "seed/interface-floor.json",
+    "migrations/**/*.sql",
+    "docs/guides/PERSONAL_AGENT_CONFIG_KIT.md",
+    "npm-shrinkwrap.json",
+    "setup/status.schema.json",
+    "README.md",
+    "CHANGELOG.md",
+    "socket.yml",
+    "LICENSE",
+    ".agents/skills/async-job-orchestration/SKILL.md",
+    ".agents/skills/multi-llm-review/SKILL.md",
+    ".agents/skills/session-workflow/SKILL.md",
+    ".agents/skills/secure-orchestration/SKILL.md",
+    ".agents/skills/implement-review-fix/SKILL.md",
+    ".agents/skills/retrospective-walk/SKILL.md",
+    ".agents/skills/public-demo-session/SKILL.md",
+    ".agents/skills/least-cost-routing/SKILL.md",
+    ".agents/skills/personal-agent-config-kit/SKILL.md"
+  ],
+  "scripts": {
+    "clean:dist": "node scripts/clean-dist.mjs",
+    "build": "npm run clean:dist && tsc -p tsconfig.build.json",
+    "build:all": "tsc",
+    "pack:check": "node scripts/verify-packed-dist.mjs",
+    "prepack": "npm run pack:check",
+    "prepublishOnly": "npm run build && npm test && npm run pack:check",
+    "start": "node dist/index.js",
+    "start:http": "node dist/index.js --transport=http",
+    "doctor": "node dist/index.js doctor --json",
+    "migrate": "node dist/migrate.js",
+    "test": "vitest run",
+    "test:ci": "vitest run --pool=forks --maxWorkers=1",
+    "test:fuzz": "vitest run src/__tests__/fuzz.test.ts",
+    "test:coverage": "vitest run --coverage",
+    "test:watch": "vitest",
+    "test:unit": "vitest run src/__tests__/executor.test.ts",
+    "test:session": "vitest run src/__tests__/session-manager.test.ts",
+    "test:session-pg": "bash ./scripts/test-pg.sh src/__tests__/session-manager-pg.test.ts",
+    "test:integration": "INTEGRATION_TESTS=1 vitest run src/__tests__/integration.test.ts",
+    "test:pg": "bash ./scripts/test-pg.sh",
+    "test:all": "npm run test && npm run test:pg",
+    "smoke:cache-control": "node docs/plans/slice-kappa-smoke-test.mjs",
+    "upstream:contracts": "node scripts/upstream-scan.mjs --contracts-check",
+    "upstream:drift": "node scripts/upstream-scan.mjs --require-installed --fail-on-critical",
+    "upstream:scan": "node scripts/upstream-scan.mjs",
+    "provider:surfaces:check": "node scripts/provider-surfaces-check.mjs",
+    "site:generate": "node scripts/generate-site-discovery.mjs",
+    "site:generate:check": "node scripts/generate-site-discovery.mjs --check",
+    "site:version:check": "node scripts/sync-site-version.mjs --check",
+    "site:validate": "node scripts/validate-site-discovery.mjs",
+    "supply-chain:scan": "node scripts/supply-chain/dep-drift-scan.mjs --advisory",
+    "supply-chain:scan:check": "node scripts/supply-chain/dep-drift-scan.mjs --frozen",
+    "supply-chain:seed": "node scripts/supply-chain/dep-drift-scan.mjs --seed",
+    "supply-chain:baseline:refresh": "node scripts/supply-chain/refresh-baseline.mjs",
+    "supply-chain:baseline:check": "node scripts/supply-chain/refresh-baseline.mjs --check",
+    "test:supply-chain": "vitest run scripts/supply-chain/dep-drift-scan.test.mjs",
+    "lint": "eslint src scripts site/js .github/scripts docs/plans --ignore-pattern 'src/__tests__/**'",
+    "fs:path:scope:check": "node scripts/check-fs-path-scope.mjs",
+    "lint:fix": "eslint src scripts --ignore-pattern 'src/__tests__/**' --fix",
+    "format": "prettier --write 'src/**/*.ts' 'scripts/**/*.{js,mjs}'",
+    "format:check": "prettier --check 'src/**/*.ts' 'scripts/**/*.{js,mjs}'",
+    "security:audit": "bash scripts/release-security-audit.sh",
+    "verify:no-internal-mcp:check": "node scripts/verify-no-internal-mcp.mjs --allow-unstripped-dist",
+    "search:google:submit": "node scripts/submit-google-search-console.mjs",
+    "search:google:submit:dry-run": "node scripts/submit-google-search-console.mjs --dry-run",
+    "search:submit": "node scripts/submit-indexnow.mjs",
+    "search:submit:dry-run": "node scripts/submit-indexnow.mjs --dry-run",
+    "check": "node scripts/check.mjs",
+    "release:build": "bash installer/build-release.sh",
+    "release:checksums": "cd installer/dist && sha256sum --check SHA256SUMS",
+    "release:docker": "docker compose -f docker/personal.compose.yml build",
+    "providers:rebaseline": "node scripts/rebaseline-provider-contracts.mjs",
+    "providers:rebaseline:apply": "node scripts/rebaseline-provider-contracts.mjs --apply",
+    "dag:launch-surface:check": "node scripts/check-launch-surface-dag.mjs",
+    "plans:density:check": "node scripts/check-plan-density.mjs",
+    "plans:density:update": "node scripts/check-plan-density.mjs --update",
+    "seed:generate": "node scripts/generate-provider-seed.mjs",
+    "seed:check": "node scripts/generate-provider-seed.mjs --check",
+    "surface:invariance:check": "node scripts/check-surface-host-invariance.mjs",
+    "capability:floor:check": "node scripts/check-capability-floor.mjs",
+    "capability:floor:update": "node scripts/check-capability-floor.mjs --update",
+    "interface:floor:check": "node scripts/check-interface-floor.mjs",
+    "interface:floor:update": "node scripts/check-interface-floor.mjs --update",
+    "storage:port:check": "node scripts/check-storage-port.mjs",
+    "session:tombstone:scope:check": "node scripts/check-session-tombstone-scope.mjs",
+    "test:collection:check": "node scripts/check-test-collection.mjs",
+    "test:assertion-parity": "node scripts/check-test-assertion-parity.mjs",
+    "promise:conditions:check": "node scripts/check-promise-in-condition.mjs",
+    "plans:citations:check": "node scripts/check-plan-citations.mjs",
+    "transcript:schema:parity:check": "node scripts/check-transcript-schema-parity.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "body-parser": "2.3.0",
+    "smol-toml": "^1.6.1",
+    "zod": "^4.4.3"
+  },
+  "peerDependencies": {
+    "pg": "^8.22.0"
+  },
+  "peerDependenciesMeta": {
+    "pg": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/node": "^26.0.0",
+    "@types/pg": "^8.11.10",
+    "@typescript-eslint/eslint-plugin": "^8.61.1",
+    "@typescript-eslint/parser": "^8.59.4",
+    "@vitest/coverage-v8": "^5.0.0",
+    "better-sqlite3": "^13.0.3",
+    "eslint": "^10.5.0",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-security": "^4.0.1",
+    "fast-check": "^4.8.0",
+    "pg": "^8.23.0",
+    "pg-connection-string": "2.14.0",
+    "prettier": "^3.8.4",
+    "typescript": "^6.0.3",
+    "vitest": "^5.0.0"
+  },
+  "overrides": {
+    "body-parser": "2.3.0",
+    "type-is": "2.1.0",
+    "fast-uri": "3.1.7",
+    "qs": "6.16.0",
+    "brace-expansion": "5.0.9",
+    "hono": "4.13.5",
+    "@hono/node-server": "2.0.11",
+    "ip-address": "10.3.1",
+    "nanoid": "3.3.18",
+    "postcss": "8.5.23"
+  },
+  "directories": {
+    "doc": "docs"
+  },
+  "types": "./dist/index.d.ts",
+  "allowScripts": {
+    "better-sqlite3@13.0.3": true,
+    "fsevents": false
+  }
+}

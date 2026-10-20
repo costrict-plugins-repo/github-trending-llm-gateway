@@ -1,0 +1,14 @@
+[Unit]
+Description=Daily llm-cli-gateway host auto-upgrade check (latest npm release)
+Documentation=https://github.com/verivus-oss/llm-cli-gateway/blob/main/scripts/host-upgrade.sh
+
+[Timer]
+# Daily cadence debounces npm patch churn: at most one apply per day even when
+# several patches shipped that day.
+OnCalendar=daily
+RandomizedDelaySec=30m
+# Catch up after the machine was off.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
